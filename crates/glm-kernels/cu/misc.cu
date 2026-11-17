@@ -130,6 +130,71 @@ extern "C" __global__ void glm_embed(bf16* __restrict__ out, const bf16* __restr
 
 // KV cache layout: kcache[nkv][max_seq][hd], vcache[nkv][max_seq][hd].
 
+
+// One launch per layer for the whole Q/K/V epilogue: per-head RMSNorm on Q and K, rotation of
+// both, and the K/V append into the bf16 cache. Replaces glm_rmsnorm_heads x2 + glm_rope_kv.
+extern "C" __global__ void glm_qk_norm_rope_kv(bf16* __restrict__ q, const bf16* __restrict__ k,
+                                               const bf16* __restrict__ v,
+                                               const bf16* __restrict__ qg, const bf16* __restrict__ kg,
+                                               bf16* __restrict__ kc, bf16* __restrict__ vc,
+                                               const int* __restrict__ pos, int rows, int nq, int nkv,
+                                               int hd, int rot, float theta, float eps, int max_seq) {
+    pdl_wait();
+    __shared__ float sv[8];
+    const float lgt = log2f(theta);
+    const int half = rot >> 1;
+    const int nqt = rows * nq, nkt = rows * nkv;
+    for (int t = blockIdx.x; t < nqt + nkt; t += gridDim.x) {
+        const bool isq = t < nqt;
+        const int u = isq ? t : t - nqt;
+        const int r = isq ? u / nq : u / nkv;
+        const int h = isq ? u % nq : u % nkv;
+        bf16* base = isq ? q + ((size_t)r * nq + h) * hd : nullptr;
+        const bf16* src = isq ? base : (k + ((size_t)r * nkv + h) * hd);
+        const bf16* g = isq ? qg : kg;
+        float ss = 0.f;
+        for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+            const float x = b2f(src[i]);
+            ss = fmaf(x, x, ss);
+        }
+        ss = block_sum(ss, sv);
+        const float inv = rsqrtf(ss / (float)hd + eps);
+        if (isq) {
+            for (int e = threadIdx.x; e < half; e += blockDim.x) {
+                const float a = b2f(src[e]) * inv * b2f(g[e]);
+                const float b = b2f(src[e + half]) * inv * b2f(g[e + half]);
+                const float ang = (float)pos[r] * exp2f(-(float)(2 * e) / (float)rot * lgt);
+                float c, s2;
+                __sincosf(ang, &s2, &c);
+                base[e] = f2b(a * c - b * s2);
+                base[e + half] = f2b(b * c + a * s2);
+            }
+            for (int i = rot + threadIdx.x; i < hd; i += blockDim.x) base[i] = f2b(b2f(src[i]) * inv * b2f(g[i]));
+        } else {
+            const size_t dst = ((size_t)h * max_seq + pos[0] + r) * hd;
+            const bf16* vsrc = v + ((size_t)r * nkv + h) * hd;
+            for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+                float val;
+                if (i < rot) {
+                    const int e = i < half ? i : i - half;
+                    const float a = b2f(src[e]) * inv * b2f(g[e]);
+                    const float b = b2f(src[e + half]) * inv * b2f(g[e + half]);
+                    const float ang = (float)pos[r] * exp2f(-(float)(2 * e) / (float)rot * lgt);
+                    float c, s2;
+                    __sincosf(ang, &s2, &c);
+                    val = i < half ? a * c - b * s2 : b * c + a * s2;
+                } else {
+                    val = b2f(src[i]) * inv * b2f(g[i]);
+                }
+                kc[dst + i] = f2b(val);
+                vc[dst + i] = vsrc[i];
+            }
+        }
+        __syncthreads();
+    }
+    pdl_launch();
+}
+
 // Fused interleaved-rope + KV append: rotates Q in place, rotates K on the fly and writes both
 // K and V into the bf16 cache. Replaces glm_rope_qk + glm_kv_append for the bf16 KV mode, so a
 // layer issues one launch and one round-trip instead of three.

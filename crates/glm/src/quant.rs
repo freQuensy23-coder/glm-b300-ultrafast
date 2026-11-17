@@ -563,4 +563,43 @@ mod fp4_tests {
             }
         }
     }
+
+    /// The fused QK kernel normalises each head first and rotates the normalised values; a
+    /// regression that rotates raw values would still pass every structural test.
+    #[test]
+    fn fused_qk_norm_then_rope_matches_two_pass() {
+        let (hd, rot, theta, eps) = (128usize, 64usize, 1e4f32, 1e-5f32);
+        let half = rot / 2;
+        let head: Vec<f32> = (0..hd).map(|i| ((i as f32) * 0.29).cos()).collect();
+        let gamma: Vec<f32> = (0..hd).map(|i| 0.5 + (i as f32) * 0.01).collect();
+        let ss: f32 = head.iter().map(|v| v * v).sum();
+        let inv = 1.0 / (ss / hd as f32 + eps).sqrt();
+        for pos in [0usize, 3, 1024] {
+            // two pass: normalise the whole head, then rotate pairs
+            let normed: Vec<f32> = (0..hd).map(|i| head[i] * inv * gamma[i]).collect();
+            let mut want = normed.clone();
+            for e in 0..half {
+                let ang = pos as f32 / theta.powf(2.0 * e as f32 / rot as f32);
+                let (c, s) = (ang.cos(), ang.sin());
+                want[e] = normed[e] * c - normed[e + half] * s;
+                want[e + half] = normed[e + half] * c + normed[e] * s;
+            }
+            // fused: normalise and rotate in one pass, per lane
+            let mut got = vec![0f32; hd];
+            for e in 0..half {
+                let ang = pos as f32 / theta.powf(2.0 * e as f32 / rot as f32);
+                let (c, s) = (ang.cos(), ang.sin());
+                let a = head[e] * inv * gamma[e];
+                let b = head[e + half] * inv * gamma[e + half];
+                got[e] = a * c - b * s;
+                got[e + half] = b * c + a * s;
+            }
+            for i in rot..hd {
+                got[i] = head[i] * inv * gamma[i];
+            }
+            for i in 0..hd {
+                assert!((want[i] - got[i]).abs() <= 1e-5, "dim {i} pos {pos}");
+            }
+        }
+    }
 }

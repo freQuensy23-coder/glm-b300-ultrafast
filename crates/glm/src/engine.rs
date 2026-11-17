@@ -307,6 +307,19 @@ impl Engine {
         self.launch("glm_rope_qk", Launch::new((total as u32).div_ceil(256).min(4096).max(1), 256), &mut a)
     }
 
+    /// Per-head QK-norm, rotation and the bf16 K/V append in one launch.
+    fn qk_norm_rope_kv(&self, slot: usize, layer: &Layer, m: usize) -> Result<()> {
+        let (kc, vc) = self.kv.ptrs(slot);
+        let c = &self.cfg;
+        let mut a = Args::new();
+        a.ptr(self.b.q.ptr).ptr(self.b.kn.ptr).ptr(self.b.vn.ptr).ptr(layer.q_norm.ptr)
+            .ptr(layer.k_norm.ptr).ptr(kc).ptr(vc).ptr(self.b.tob.ptr)
+            .i32(m as i32).i32(c.n_heads as i32).i32(c.n_kv as i32).i32(c.head_dim as i32)
+            .i32(c.rope_dim as i32).f32(c.rope_theta).f32(c.rms_eps).i32(self.kv.max_seq as i32);
+        let blocks = ((m * (c.n_heads + c.n_kv)) as u32).max(1);
+        self.launch("glm_qk_norm_rope_kv", Launch::new(blocks, 128), &mut a)
+    }
+
     /// Rotate Q in place and append rope'd K plus V to the bf16 cache in a single pass.
     fn rope_kv_append(&self, slot: usize, _start: usize, m: usize) -> Result<()> {
         let (kc, vc) = self.kv.ptrs(slot);
@@ -606,10 +619,14 @@ impl Engine {
         if let Some(bias) = &layer.qkv_bias {
             self.add_qkv_bias(bias.ptr, m)?;
         }
-        self.norm_heads(self.b.q.ptr, layer.q_norm.ptr, c.n_heads, m)?;
-        self.norm_heads(self.b.kn.ptr, layer.k_norm.ptr, c.n_kv, m)?;
-        // Every KV mode fuses the rotation into the append: one launch and one round-trip.
-        self.rope_kv_append(slot, start, m)?;
+        if self.kv.mode == crate::cache::KvMode::Bf16 {
+            // One launch: per-head QK-norm, rotation and the K/V append.
+            self.qk_norm_rope_kv(slot, layer, m)?;
+        } else {
+            self.norm_heads(self.b.q.ptr, layer.q_norm.ptr, c.n_heads, m)?;
+            self.norm_heads(self.b.kn.ptr, layer.k_norm.ptr, c.n_kv, m)?;
+            self.rope_kv_append(slot, start, m)?;
+        }
         if prefill {
             self.attn_prefill(slot, start, m)?;
         } else {
