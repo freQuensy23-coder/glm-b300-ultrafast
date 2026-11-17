@@ -136,3 +136,19 @@ The server's `request_end` log line reports each request's step time (`average_i
 The kernels were optimized by coding agents that could read the source of
 [FlashInfer](https://github.com/flashinfer-ai/flashinfer) and [SGLang](https://github.com/sgl-project/sglang)
 while they worked.
+
+## Single-GPU GLM port
+
+This tree also contains a port that serves GLM-class MoE checkpoints (GLM-5.3-Flash) on **one**
+B300 (`sm_103a`), which upstream cannot do: `tp = 1` is rejected by the engine's profile gates
+and several kernels only exist in 4- and 8-rank instantiations.
+
+- New crates: `crates/glm-kernels` (CUDA) and `crates/glm` (engine, loader, HTTP).
+- Analysis: `docs/analysis/01-architecture.md` (how upstream works),
+  `02-transfer-matrix.md` (which optimization transfers, which is DeepSeek-only),
+  `03-multi-gpu-inventory.md`, `04-kernel-inventory.md`, `05-concurrency-and-batching.md`,
+  `06-port.md` (what the port does and does not do).
+- Quick start: `glm-serve --ckpt <dir> --plan` (no GPU needed), then `--prompt` or `--port`.
+- `cargo test -p deepseek-ultrafast-glm` runs 36 tests that need no device.
+- `--graph 7` captures the whole speculative round (draft, device-side width choice, every
+  verify branch) into one conditional CUDA graph.
