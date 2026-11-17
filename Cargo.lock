@@ -661,6 +661,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepseek-ultrafast-glm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "deepseek-ultrafast-cuda",
+ "deepseek-ultrafast-model",
+ "futures",
+ "glm-kernels",
+ "half",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokenizers",
+ "tokio",
+]
+
+[[package]]
 name = "deepseek-ultrafast-kernels"
 version = "0.1.0"
 dependencies = [
@@ -1161,6 +1180,14 @@ checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
 dependencies = [
  "color_quant",
  "weezl",
+]
+
+[[package]]
+name = "glm-kernels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "deepseek-ultrafast-cuda",
 ]
 
 [[package]]
@@ -2821,6 +2848,19 @@ dependencies = [
  "filetime",
  "libc",
  "xattr",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
