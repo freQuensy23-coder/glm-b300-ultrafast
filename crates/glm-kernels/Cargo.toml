@@ -1,0 +1,10 @@
+[package]
+name = "glm-kernels"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+deepseek-ultrafast-cuda = { path = "../cuda" }
+
+[build-dependencies]

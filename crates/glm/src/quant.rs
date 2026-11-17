@@ -1,0 +1,605 @@
+//! Weight quantization to the layout the kernels consume: row-major fp8 e4m3 with
+//! one fp32 scale per 128x128 block, plus zero padding to multiples of 128.
+//!
+//! This is the layout Hugging Face `*-block-fp8` checkpoints already use, so an fp8
+//! checkpoint is uploaded without requantization and a bf16 checkpoint is quantized
+//! on load with the same block grid.
+
+use anyhow::{ensure, Result};
+pub use deepseek_ultrafast_model::formats::e4m3_to_f32;
+use deepseek_ultrafast_model::formats::f32_to_e4m3_fast;
+use half::bf16;
+use rayon::prelude::*;
+
+pub const BLK: usize = 128;
+
+#[derive(Clone, Debug)]
+pub struct Fp8Block {
+    pub data: Vec<u8>,
+    pub scales: Vec<f32>,
+    /// Padded output-row count and reduction width.
+    pub n: usize,
+    pub k: usize,
+}
+
+impl Fp8Block {
+    pub fn rows_of_scales(&self) -> usize {
+        self.n / BLK
+    }
+
+    pub fn cols_of_scales(&self) -> usize {
+        self.k / BLK
+    }
+
+    pub fn scale_at(&self, row: usize, kb: usize) -> f32 {
+        self.scales[(row / BLK) * self.cols_of_scales() + kb]
+    }
+
+    /// Dequantize one element; used by tests and by the reference checker.
+    pub fn dequant(&self, r: usize, c: usize) -> f32 {
+        e4m3_to_f32(self.data[r * self.k + c]) * self.scale_at(r, c / BLK)
+    }
+}
+
+fn pad_to(v: usize, m: usize) -> usize {
+    v.next_multiple_of(m)
+}
+
+/// e4m3 encode with round-to-nearest, saturating at the format maximum.
+pub fn e4m3_from_f32(v: f32) -> u8 {
+    f32_to_e4m3_fast(v)
+}
+
+/// Quantize bf16 weights `[n, k]` (row-major) into the block-fp8 layout.
+pub fn quantize_bf16(w: &[u16], n: usize, k: usize) -> Result<Fp8Block> {
+    ensure!(w.len() == n * k, "weight has {} values, expected {n}x{k}", w.len());
+    let (np, kp) = (pad_to(n, BLK), pad_to(k, BLK));
+    let mut data = vec![0u8; np * kp];
+    let nkb = kp / BLK;
+    let mut scales = vec![0f32; (np / BLK) * nkb];
+
+    data.par_chunks_mut(BLK * kp)
+        .zip(scales.par_chunks_mut(nkb))
+        .enumerate()
+        .for_each(|(rb, (dst, srow))| {
+            for kb in 0..nkb {
+                let mut amax = 0f32;
+                for r in 0..BLK {
+                    let row = rb * BLK + r;
+                    if row >= n {
+                        continue;
+                    }
+                    for c in kb * BLK..kb * BLK + BLK {
+                        if c >= k {
+                            break;
+                        }
+                        amax = amax.max(bf16::from_bits(w[row * k + c]).to_f32().abs());
+                    }
+                }
+                let scale = if amax > 0.0 { amax / 448.0 } else { 1.0 };
+                srow[kb] = scale;
+                let inv = 1.0 / scale;
+                for r in 0..BLK {
+                    let row = rb * BLK + r;
+                    if row >= n {
+                        break;
+                    }
+                    for c in kb * BLK..kb * BLK + BLK {
+                        if c >= k {
+                            break;
+                        }
+                        let v = bf16::from_bits(w[row * k + c]).to_f32() * inv;
+                        dst[r * kp + c] = f32_to_e4m3_fast(v);
+                    }
+                }
+            }
+        });
+    Ok(Fp8Block { data, scales, n: np, k: kp })
+}
+
+/// Adopt an fp8 checkpoint tensor: bytes stay as they are, only the scale tensor is
+/// reinterpreted. `scale_inv[r, c]` is the multiplier that dequantizes block (r, c).
+pub fn adopt_fp8(w: &[u8], scale_inv: &[f32], n: usize, k: usize) -> Result<Fp8Block> {
+    ensure!(n % BLK == 0 && k % BLK == 0, "fp8 checkpoint tensor {n}x{k} is not 128-aligned; requantize from bf16");
+    ensure!(w.len() == n * k, "fp8 tensor has {} bytes, expected {}", w.len(), n * k);
+    let expect = (n / BLK) * (k / BLK);
+    ensure!(scale_inv.len() == expect, "scale tensor has {} values, expected {expect}", scale_inv.len());
+    ensure!(scale_inv.iter().all(|s| s.is_finite() && *s > 0.0), "scale tensor contains non-positive values");
+    Ok(Fp8Block { data: w.to_vec(), scales: scale_inv.to_vec(), n, k })
+}
+
+/// Zero-pad a bf16 matrix `[n, k]` to `[np, kp]` (used for embeddings and lm_head).
+pub fn pad_bf16(w: &[u16], n: usize, k: usize, np: usize, kp: usize) -> Vec<u16> {
+    if n == np && k == kp {
+        return w.to_vec();
+    }
+    let mut out = vec![0u16; np * kp];
+    out.par_chunks_mut(kp).enumerate().for_each(|(r, row)| {
+        if r < n {
+            row[..k].copy_from_slice(&w[r * k..(r + 1) * k]);
+        }
+    });
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(n: usize, k: usize) -> Vec<u16> {
+        let mut s = 0x1234_5678_9abc_def0u64;
+        (0..n * k)
+            .map(|i| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let base = ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.4;
+                // one large outlier per 128x128 block stresses the block scale
+                let v = if i % (BLK * BLK) == 0 { base * 40.0 } else { base };
+                bf16::from_f32(v).to_bits()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn quantize_roundtrip_stays_within_fp8_error() {
+        let (n, k) = (256, 384);
+        let w = sample(n, k);
+        let q = quantize_bf16(&w, n, k).unwrap();
+        assert_eq!(q.n, n);
+        assert_eq!(q.k, k);
+        assert_eq!(q.scales.len(), (n / BLK) * (k / BLK));
+        let mut worst = 0f32;
+        for r in 0..n {
+            for c in 0..k {
+                let x = bf16::from_bits(w[r * k + c]).to_f32();
+                let y = q.dequant(r, c);
+                let scale = q.scale_at(r, c / BLK);
+                // e4m3 has 3 mantissa bits (relative half-ulp 1/16) plus one subnormal step
+                assert!(
+                    (x - y).abs() <= x.abs() / 16.0 + scale / 512.0 + 1e-6,
+                    "{r},{c}: {x} vs {y} (scale {scale})"
+                );
+                if x.abs() > 1e-3 {
+                    worst = worst.max((x - y).abs() / x.abs());
+                }
+            }
+        }
+        assert!(worst < 0.1, "worst relative error {worst}");
+    }
+
+    #[test]
+    fn pads_ragged_shapes() {
+        let w = sample(130, 200);
+        let q = quantize_bf16(&w, 130, 200).unwrap();
+        assert_eq!((q.n, q.k), (256, 256));
+        assert_eq!(q.data.len(), 256 * 256);
+        // padding is zero and every padded block still has a usable scale
+        assert_eq!(q.dequant(200, 100), 0.0);
+        assert!(q.scales.iter().all(|s| *s > 0.0));
+        let p = pad_bf16(&w, 130, 200, 256, 256);
+        assert_eq!(p.len(), 256 * 256);
+        assert_eq!(p[129 * 256 + 199], w[129 * 200 + 199]);
+        assert_eq!(p[130 * 256 + 5], 0);
+    }
+
+    #[test]
+    fn rejects_unaligned_fp8_tensors() {
+        let e = adopt_fp8(&[0u8; 100 * 100], &vec![1.0; 4], 100, 100).unwrap_err().to_string();
+        assert!(e.contains("128-aligned"), "{e}");
+        let e = adopt_fp8(&[0u8; 128 * 128], &vec![1.0; 3], 128, 128).unwrap_err().to_string();
+        assert!(e.contains("scale tensor"), "{e}");
+    }
+}
+
+/// MX-style quantization for the tensor-core path: e4m3 data with one **power-of-two**
+/// e8m0 scale per 32-element block along K.
+///
+/// The tcgen05 kernels consume scales as `[n][k/32]` e8m0 bytes and stream them through a
+/// `tcgen05.cp` tile, so the scale must be exactly `2^(e-127)`; a free-form fp32 scale
+/// cannot be expressed there. Snapping to a power of two costs at most one extra bit of
+/// error versus a per-block fp32 scale, which is what the mxfp8 format does anyway.
+pub struct Mx {
+    /// `[n][k]` e4m3 bytes, row-major.
+    pub data: Vec<u8>,
+    /// `[n][k/32]` e8m0 scale bytes.
+    pub sf: Vec<u8>,
+}
+
+/// e4m3 max magnitude; blocks are scaled so the largest element lands just under it.
+const E4M3_MAX: f32 = 448.0;
+
+pub fn quantize_mx(src: &[f32], n: usize, k: usize) -> Mx {
+    assert_eq!(src.len(), n * k, "mx quantize: shape mismatch");
+    assert!(k % 32 == 0, "mx quantize: k must be a multiple of 32");
+    let mut data = vec![0u8; n * k];
+    let mut sf = vec![0u8; n * (k / 32)];
+    for r in 0..n {
+        for b in 0..k / 32 {
+            let base = r * k + b * 32;
+            let mut amax = 0f32;
+            for j in 0..32 {
+                amax = amax.max(src[base + j].abs());
+            }
+            // scale = 2^e with 2^e >= amax / E4M3_MAX
+            let mut e = 0i32;
+            if amax > 0.0 {
+                e = (amax / E4M3_MAX).log2().ceil() as i32;
+                e = e.clamp(-127, 127);
+            }
+            let scale = pow2(e);
+            sf[r * (k / 32) + b] = (e + 127) as u8;
+            let inv = 1.0 / scale;
+            for j in 0..32 {
+                data[base + j] = e4m3_from_f32(src[base + j] * inv);
+            }
+        }
+    }
+    Mx { data, sf }
+}
+
+/// Convert row-major fp8 weights into the `mma.sync` tile layout the non-tcgen05 GEMV
+/// kernels read (`tile_fp8`), keeping the payload byte-for-byte identical — the transform is a
+/// permutation of 64x32 subtiles plus the per-32 scale stripe interleave, so a wrong mapping
+/// shows up immediately as a mismatched multiset.
+pub fn tile_fp8_mma(data: &[u8], n: usize, k: usize) -> Vec<u8> {
+    deepseek_ultrafast_model::formats::tile_fp8(data, n, k)
+}
+
+/// Re-express a block-fp8 matrix in the mxfp8 form the tensor-core kernels consume:
+/// every scale becomes an exact power of two, the fp8 payload is rescaled to match, and the
+/// scales are folded into the 512-byte-per-128x128 tiles `tcgen05.cp` streams.
+///
+/// `scales` is rewritten in place (so the FMA fallback keeps agreeing with the tiles) and the
+/// tiled e8m0 bytes are returned. Rescaling moves each value by a factor in (0.5, 1], i.e. at
+/// most one e4m3 ulp.
+pub fn mx_rescale(data: &mut [u8], scales: &mut [f32], n: usize, k: usize) -> Vec<u8> {
+    assert_eq!(data.len(), n * k, "mx rescale: payload shape mismatch");
+    let (nrb, nkb) = (n / 128, k / 128);
+    assert_eq!(scales.len(), nrb * nkb, "mx rescale: scale count mismatch");
+    let mut sf = vec![127u8; n * (k / 32)];
+    for rb in 0..nrb {
+        for kb in 0..nkb {
+            let s = scales[rb * nkb + kb];
+            let e = if s > 0.0 { (s.log2().ceil() as i32).clamp(-127, 127) } else { 0 };
+            let scale = pow2(e);
+            scales[rb * nkb + kb] = scale;
+            let f = if s > 0.0 { s / scale } else { 1.0 };
+            // one LUT per block: table lookup beats re-rounding every element through f32 math
+            let mut lut = [0u8; 256];
+            for (i, slot) in lut.iter_mut().enumerate() {
+                *slot = e4m3_from_f32(e4m3_to_f32(i as u8) * f);
+            }
+            for r in rb * 128..(rb + 1) * 128 {
+                let base = r * k + kb * 128;
+                for c in 0..128 {
+                    data[base + c] = lut[data[base + c] as usize];
+                }
+                for sub in 0..4 {
+                    sf[r * (k / 32) + kb * 4 + sub] = (e + 127) as u8;
+                }
+            }
+        }
+    }
+    deepseek_ultrafast_model::formats::tile_sf_blocks(&sf, n, k)
+}
+
+fn pow2(e: i32) -> f32 {
+    f32::from_bits((((e + 127) as u32) & 0xff) << 23)
+}
+
+#[cfg(test)]
+mod mx_tests {
+    use super::*;
+
+    #[test]
+    fn scales_are_powers_of_two_and_lossless() {
+        let (n, k) = (128usize, 128usize);
+        let src: Vec<f32> = (0..n * k).map(|i| ((i % 97) as f32 - 48.0) * 0.037).collect();
+        let q = quantize_mx(&src, n, k);
+        assert_eq!(q.data.len(), n * k);
+        assert_eq!(q.sf.len(), n * k / 32);
+        for (i, &b) in q.sf.iter().enumerate() {
+            let e = b as i32 - 127;
+            assert!((-127..=127).contains(&e), "block {i} exponent {e}");
+        }
+    }
+
+    #[test]
+    fn round_trip_stays_inside_the_e4m3_bound() {
+        let (n, k) = (64usize, 64usize);
+        let src: Vec<f32> = (0..n * k).map(|i| ((i * 7919 % 1000) as f32 / 1000.0 - 0.5) * 6.0).collect();
+        let q = quantize_mx(&src, n, k);
+        for r in 0..n {
+            for b in 0..k / 32 {
+                let e = q.sf[r * (k / 32) + b] as i32 - 127;
+                let scale = pow2(e);
+                for j in 0..32 {
+                    let x = src[r * k + b * 32 + j];
+                    let y = e4m3_to_f32(q.data[r * k + b * 32 + j]) * scale;
+                    assert!(
+                        (x - y).abs() <= x.abs() / 16.0 + scale / 512.0 + 1e-6,
+                        "{x} vs {y} (scale {scale})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mx_rescale_makes_scales_exact_powers_of_two() {
+        let (n, k) = (128usize, 256usize);
+        let src: Vec<f32> = (0..n * k).map(|i| ((i * 37 % 101) as f32 / 101.0 - 0.5) * 4.0).collect();
+        let mut blk = quantize_bf16(&src.iter().map(|v| bf16::from_f32(*v).to_bits()).collect::<Vec<_>>(), n, k).unwrap();
+        let before: Vec<f32> = (0..n * k).map(|i| blk.dequant(i / k, i % k)).collect();
+        let tiled = mx_rescale(&mut blk.data, &mut blk.scales, n, k);
+        for &s in &blk.scales {
+            assert_eq!(s, pow2((s.log2().round()) as i32), "scale {s} is not 2^e");
+        }
+        assert_eq!(tiled.len(), (n / 128) * (k / 128) * 512);
+        let mut worst = 0f32;
+        for i in 0..n * k {
+            let after = blk.dequant(i / k, i % k);
+            worst = worst.max((after - before[i]).abs() / (before[i].abs() + 1e-9));
+        }
+        assert!(worst < 0.13, "rescaling moved a value by {worst}");
+    }
+
+    #[test]
+    fn tile_layout_is_a_permutation() {
+        let (n, k) = (128usize, 128usize);
+        let src: Vec<u8> = (0..n * k).map(|i| (i % 251) as u8).collect();
+        let tiled = tile_fp8_mma(&src, n, k);
+        assert_eq!(tiled.len(), src.len());
+        let mut a = src.clone();
+        let mut b = tiled.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b, "tile_fp8 must not change the payload, only its order");
+    }
+
+    #[test]
+    fn sf_tiles_have_the_layout_the_kernel_streams() {
+        use deepseek_ultrafast_model::formats::tile_sf_blocks;
+        let (n, k) = (256usize, 256usize);
+        let src = vec![0.25f32; n * k];
+        let q = quantize_mx(&src, n, k);
+        let tiled = tile_sf_blocks(&q.sf, n, k);
+        assert_eq!(tiled.len(), (n / 128) * (k / 128) * 512);
+    }
+}
+
+/// fp4 (e2m1) expert weights with e8m0 per-32 scales — the format the tcgen05 MoE kernels
+/// and their packing helpers consume.
+pub struct Fp4 {
+    /// `[n][k/2]`: two e2m1 nibbles per byte along K.
+    pub w: Vec<u8>,
+    /// `[n][k/32]` e8m0 scale bytes.
+    pub s: Vec<u8>,
+    pub n: usize,
+    pub k: usize,
+}
+
+/// e2m1 magnitudes, ordered so nearest-value search is a binary walk.
+const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+
+fn e2m1_code(v: f32) -> u8 {
+    let a = v.abs();
+    let mut best = 0usize;
+    let mut err = f32::INFINITY;
+    for (i, &m) in E2M1.iter().enumerate() {
+        let e = (m - a).abs();
+        if e < err {
+            err = e;
+            best = i;
+        }
+    }
+    best as u8 | if v < 0.0 { 0x8 } else { 0 }
+}
+
+pub fn e2m1_value(code: u8) -> f32 {
+    let m = E2M1[(code & 0x7) as usize];
+    if code & 0x8 != 0 { -m } else { m }
+}
+
+/// Quantize `[n, k]` f32 into fp4 with one power-of-two scale per 32 values along K.
+pub fn fp4_quant(src: &[f32], n: usize, k: usize) -> Fp4 {
+    assert_eq!(src.len(), n * k);
+    assert!(k % 32 == 0);
+    let mut w = vec![0u8; n * k / 2];
+    let mut s = vec![127u8; n * (k / 32)];
+    for r in 0..n {
+        for b in 0..k / 32 {
+            let base = r * k + b * 32;
+            let mut amax = 0f32;
+            for j in 0..32 {
+                amax = amax.max(src[base + j].abs());
+            }
+            let e = if amax > 0.0 { (amax / 6.0).log2().ceil() as i32 } else { 0 }.clamp(-127, 127);
+            let scale = pow2(e);
+            let inv = 1.0 / scale;
+            s[r * (k / 32) + b] = (e + 127) as u8;
+            for j in 0..16 {
+                let lo = e2m1_code(src[base + 2 * j] * inv);
+                let hi = e2m1_code(src[base + 2 * j + 1] * inv);
+                w[r * (k / 2) + b * 16 + j] = lo | (hi << 4);
+            }
+        }
+    }
+    Fp4 { w, s, n, k }
+}
+
+/// Inverse of [`fp4_quant`], used by the tests and by the CPU reference path.
+pub fn fp4_dequant(q: &Fp4, r: usize, c: usize) -> f32 {
+    let byte = q.w[r * (q.k / 2) + c / 2];
+    let code = if c % 2 == 0 { byte & 0xf } else { byte >> 4 };
+    let e = q.s[r * (q.k / 32) + c / 32] as i32 - 127;
+    e2m1_value(code) * pow2(e)
+}
+
+/// Pack one expert's three matrices into the buffers the tcgen05 MoE kernels index.
+pub fn pack_expert_tc(gate: &Fp4, up: &Fp4, down: &Fp4, dim: usize, inter: usize) -> (Vec<u8>, Vec<u8>) {
+    use deepseek_ultrafast_model::packing::{expert_shard_tc, w2_rowmajor_bytes, Fp4Matrix};
+    fn m(q: &Fp4) -> Fp4Matrix<'_> {
+        Fp4Matrix { w: &q.w, s: &q.s, n: q.n, k: q.k }
+    }
+    let mut out13 = vec![0u8; inter * dim + (2 * inter / 128) * (dim / 128) * 512];
+    let mut out2 = vec![0u8; w2_rowmajor_bytes(dim, inter)];
+    expert_shard_tc(m(gate), m(up), m(down), 0, 1, &mut out13, &mut out2);
+    (out13, out2)
+}
+
+#[cfg(test)]
+mod fp4_tests {
+    use super::*;
+
+    fn ramp(n: usize, k: usize, seed: f32) -> Vec<f32> {
+        (0..n * k).map(|i| (((i as f32 * 0.013 + seed).sin()) * 3.0)).collect()
+    }
+
+    #[test]
+    fn fp4_scales_are_pow2_and_values_stay_on_the_grid() {
+        let (n, k) = (32usize, 64usize);
+        let src = ramp(n, k, 0.0);
+        let q = fp4_quant(&src, n, k);
+        assert_eq!(q.w.len(), n * k / 2);
+        assert_eq!(q.s.len(), n * k / 32);
+        for i in 0..n * k {
+            let d = fp4_dequant(&q, i / k, i % k);
+            let e = q.s[i / k * (k / 32) + (i % k) / 32] as i32 - 127;
+            assert!((d / pow2(e)).abs() <= 6.0001, "value off the e2m1 grid");
+        }
+    }
+
+    #[test]
+    fn fp4_round_trip_is_within_one_grid_step() {
+        let (n, k) = (64usize, 128usize);
+        let src = ramp(n, k, 1.7);
+        let q = fp4_quant(&src, n, k);
+        let mut worst = 0f32;
+        for r in 0..n {
+            for c in 0..k {
+                let a = src[r * k + c];
+                let b = fp4_dequant(&q, r, c);
+                let step = (b.abs().max(a.abs()) * 0.5).max(1e-3);
+                worst = worst.max((a - b).abs() / step);
+            }
+        }
+        assert!(worst < 3.0, "fp4 round trip drift {worst}");
+    }
+
+    /// CPU mirror of `glm_gemv_fp4`: same nibble order, same per-32 exponent. If the kernel
+    /// reads a different byte or scale, this reference and the device disagree.
+    #[test]
+    fn fp4_gemv_mirror_matches_the_kernel() {
+        let (n, k, m) = (64usize, 128usize, 3usize);
+        let w: Vec<f32> = (0..n * k).map(|i| ((i as f32 * 0.031).sin()) * 2.0).collect();
+        let x: Vec<f32> = (0..m * k).map(|i| ((i as f32 * 0.017).cos()) * 1.5).collect();
+        let q = fp4_quant(&w, n, k);
+        for t in 0..m {
+            for r in 0..n {
+                let mut acc = 0f32;
+                for kb in 0..k / 32 {
+                    let scale = pow2(q.s[r * (k / 32) + kb] as i32 - 127);
+                    let mut a = 0f32;
+                    for j in 0..32 {
+                        let byte = q.w[r * (k / 2) + kb * 16 + j / 2];
+                        let nib = if j % 2 == 0 { byte & 0xf } else { byte >> 4 };
+                        a += x[t * k + kb * 32 + j] * e2m1_value(nib);
+                    }
+                    acc += a * scale;
+                }
+                let expect: f32 = (0..k).map(|c| x[t * k + c] * fp4_dequant(&q, r, c)).sum();
+                assert!((acc - expect).abs() <= expect.abs() * 1e-4 + 1e-3, "row {r}: {acc} vs {expect}");
+            }
+        }
+    }
+
+    #[test]
+    fn expert_packing_produces_the_kernel_buffer_sizes() {
+        let (dim, inter) = (128usize, 64usize);
+        let g = fp4_quant(&ramp(inter, dim, 0.3), inter, dim);
+        let u = fp4_quant(&ramp(inter, dim, 0.9), inter, dim);
+        let d = fp4_quant(&ramp(dim, inter, 1.4), dim, inter);
+        let (w13, w2) = pack_expert_tc(&g, &u, &d, dim, inter);
+        assert_eq!(w13.len(), inter * dim + (2 * inter / 128) * (dim / 128) * 512);
+        assert_eq!(w2.len(), deepseek_ultrafast_model::packing::w2_rowmajor_bytes(dim, inter));
+        // the w13 payload is the interleaved gate/up nibbles, so row 0 must carry gate row 0
+        assert_eq!(&w13[..dim / 2], &g.w[..dim / 2], "w13 row 0 is not gate row 0");
+    }
+
+    /// The fused rope+append kernel rotates K lane by lane instead of rotating the whole head
+    /// first, so its pair indexing has to agree with the reference rotation exactly.
+    #[test]
+    fn fused_rope_lane_formula_matches_reference_rotation() {
+        let (hd, rot, theta) = (128usize, 64usize, 1e4f32);
+        let half = rot / 2;
+        let head: Vec<f32> = (0..hd).map(|i| (i as f32 * 0.37).sin()).collect();
+        for pos in [0usize, 1, 7, 4095] {
+            // reference: rotate the pairs (e, e + half) for e < half
+            let mut want = head.clone();
+            for e in 0..half {
+                let ang = pos as f32 / theta.powf(2.0 * e as f32 / rot as f32);
+                let (c, s) = (ang.cos(), ang.sin());
+                let (a, b) = (head[e], head[e + half]);
+                want[e] = a * c - b * s;
+                want[e + half] = b * c + a * s;
+            }
+            // fused: one thread per lane, as `glm_rope_kv*` computes it
+            let mut got = head.clone();
+            for col in 0..rot {
+                let e = if col < half { col } else { col - half };
+                let ang = pos as f32 / theta.powf(2.0 * e as f32 / rot as f32);
+                let (c, s) = (ang.cos(), ang.sin());
+                let (a, b) = (head[e], head[e + half]);
+                got[col] = if col < half { a * c - b * s } else { b * c + a * s };
+            }
+            for col in 0..rot {
+                assert!((want[col] - got[col]).abs() <= 1e-6, "col {col} pos {pos}");
+            }
+            // lanes past the rotated window are copied untouched
+            for col in rot..hd {
+                assert_eq!(want[col], got[col]);
+            }
+        }
+    }
+
+    /// The fused QK kernel normalises each head first and rotates the normalised values; a
+    /// regression that rotates raw values would still pass every structural test.
+    #[test]
+    fn fused_qk_norm_then_rope_matches_two_pass() {
+        let (hd, rot, theta, eps) = (128usize, 64usize, 1e4f32, 1e-5f32);
+        let half = rot / 2;
+        let head: Vec<f32> = (0..hd).map(|i| ((i as f32) * 0.29).cos()).collect();
+        let gamma: Vec<f32> = (0..hd).map(|i| 0.5 + (i as f32) * 0.01).collect();
+        let ss: f32 = head.iter().map(|v| v * v).sum();
+        let inv = 1.0 / (ss / hd as f32 + eps).sqrt();
+        for pos in [0usize, 3, 1024] {
+            // two pass: normalise the whole head, then rotate pairs
+            let normed: Vec<f32> = (0..hd).map(|i| head[i] * inv * gamma[i]).collect();
+            let mut want = normed.clone();
+            for e in 0..half {
+                let ang = pos as f32 / theta.powf(2.0 * e as f32 / rot as f32);
+                let (c, s) = (ang.cos(), ang.sin());
+                want[e] = normed[e] * c - normed[e + half] * s;
+                want[e + half] = normed[e + half] * c + normed[e] * s;
+            }
+            // fused: normalise and rotate in one pass, per lane
+            let mut got = vec![0f32; hd];
+            for e in 0..half {
+                let ang = pos as f32 / theta.powf(2.0 * e as f32 / rot as f32);
+                let (c, s) = (ang.cos(), ang.sin());
+                let a = head[e] * inv * gamma[e];
+                let b = head[e + half] * inv * gamma[e + half];
+                got[e] = a * c - b * s;
+                got[e + half] = b * c + a * s;
+            }
+            for i in rot..hd {
+                got[i] = head[i] * inv * gamma[i];
+            }
+            for i in 0..hd {
+                assert!((want[i] - got[i]).abs() <= 1e-5, "dim {i} pos {pos}");
+            }
+        }
+    }
+}
