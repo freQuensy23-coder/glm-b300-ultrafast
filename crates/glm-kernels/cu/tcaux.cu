@@ -30,6 +30,7 @@ DEV int q_exp(float amax) {
 }
 
 extern "C" __global__ void glm_quant_mx(const __grid_constant__ QmxParams p) {
+    pdl_wait();
     const int row = blockIdx.x;
     if (row >= p.rows) return;
     const int nkb = p.k / 32;
@@ -77,6 +78,7 @@ extern "C" __global__ void glm_quant_mx(const __grid_constant__ QmxParams p) {
         const int t = row / 128, rr = row % 128, kti = kb / 4, kc = kb % 4;
         p.sfa[(size_t)(t * p.kt + kti) * 512 + (rr % 32) * 16 + (rr / 32) * 4 + kc] = (uint8_t)(e + 127);
     }
+    pdl_launch();
 }
 
 // Gather the routed rows into the MoE image and quantize them in one pass.
@@ -98,6 +100,7 @@ struct GqParams {
 };
 
 extern "C" __global__ void glm_gather_quant(const __grid_constant__ GqParams p) {
+    pdl_wait();
     const int r = blockIdx.x;
     if (r >= p.rows) return;
     // row_pair stores the (token, slot) index; the token row it gathers from is that / topk
@@ -135,4 +138,5 @@ extern "C" __global__ void glm_gather_quant(const __grid_constant__ GqParams p) 
         const int t = r / 128, rr = r % 128, kti = kb / 4, kc = kb % 4;
         p.sf[(size_t)(t * p.kt + kti) * 512 + (rr % 32) * 16 + (rr / 32) * 4 + kc] = (uint8_t)(e + 127);
     }
+    pdl_launch();
 }

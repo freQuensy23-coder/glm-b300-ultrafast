@@ -41,6 +41,14 @@ source greps, so `#ifdef`-gated variants are counted.
 | `ops.cu::engram_*` | retrieval-memory hooks tied to the DeepSeek serving stack |
 | `variant_topk_cand.cu`, `variant_zzzzzzzsamp`/`sds`/`aud`/`aa`/`y3` | serving-side sampling/audit variants of the upstream harness; the port samples on device inside its own round |
 
+## Latency structure (added after the first coverage audit)
+
+| Upstream mechanism | Port |
+|---|---|
+| `griddepcontrol.wait/launch_dependents` in every kernel (27 upstream units) | added to all 42 port kernels, `Launch::new` sets the programmatic-serialization attribute by default |
+| fused rope into the following kernel (`gemv.cu:135-140`, `rope.cuh:56-124`) | `glm_rope_kv`: rotates Q, rotates K and appends K/V in one launch, replacing `glm_rope_qk` + `glm_kv_append` for bf16 KV |
+| tabulated / cheap rope angles (`rope.cuh:21-22`) | `log2`-domain frequency with `exp2f` and `__sincosf` instead of `powf` + `cosf` + `sinf` |
+
 ## Still open
 
 - `gemv_xb.cu` — FMA GEMV reading a pre-quantised activation buffer. The tensor-core path already
@@ -49,3 +57,10 @@ source greps, so `#ifdef`-gated variants are counted.
   e8m0 fp4 KV packing; the mask only matters for partially filled prestage buffers.
 - `ops.cu::rope_quant` — fused rope + quantise for prefill; the port ropes and quantises in two
   passes.
+- persistent TMA-ring GEMV (`gemv_fp8b_persist_p4`, `gemv_bf16_persist_p4`), which also folds
+  top-8 selection and the softmax denominator into the epilogue.
+- fused-epilogue variants `tc_gemv2_qb/part/oa/gate` and `tc_gemv3yr_qb`, which fold rmsnorm
+  gamma, partial rope, KV append and the fp8/fp4 image write into the tcgen05 epilogue.
+- `gemv_xb.cu`: produce the fp8 activation image inside block 0 of a GEMV the model runs anyway,
+  removing the standalone `glm_quant_mx` launches.
+- `variant_zzzztg3.cu` / `variant_zzzzzy3.cu`: a tg3 `wq_b` GEMV with rope and an fp4 epilogue.

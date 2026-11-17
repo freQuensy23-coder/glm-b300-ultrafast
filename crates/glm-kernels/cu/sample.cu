@@ -38,15 +38,18 @@ DEV int argmax_row(const float* row, int n, float* sbuf, int* sibuf) {
 }
 
 extern "C" __global__ void glm_argmax(const float* __restrict__ logits, int n, int* __restrict__ out) {
+    pdl_wait();
     extern __shared__ char smem[];
     float* sb = (float*)smem;
     int* si = (int*)(sb + blockDim.x);
     const int r = argmax_row(logits, n, sb, si);
     if (threadIdx.x == 0) out[0] = r;
+    pdl_launch();
 }
 
 extern "C" __global__ void glm_sample(const float* __restrict__ logits, int n, float temp, uint64_t seed,
                                       unsigned int* __restrict__ step, int* __restrict__ out) {
+    pdl_wait();
     extern __shared__ char smem[];
     float* sslice = (float*)smem;         // B
     float* sscan = sslice + blockDim.x;   // B
@@ -99,6 +102,7 @@ extern "C" __global__ void glm_sample(const float* __restrict__ logits, int n, f
         }
         out[0] = chosen;
     }
+    pdl_launch();
 }
 
 // Speculative verification.
@@ -115,6 +119,7 @@ extern "C" __global__ void glm_spec_accept(const float* __restrict__ target, con
                                            uint64_t seed, unsigned int* __restrict__ step, int greedy,
                                            int* __restrict__ out, int* __restrict__ count,
                                            int* __restrict__ committed) {
+    pdl_wait();
     extern __shared__ char smem[];
     __shared__ uint32_t sstep;
     if (threadIdx.x == 0) sstep = atomicAdd(step, 1u);
@@ -254,6 +259,7 @@ extern "C" __global__ void glm_spec_accept(const float* __restrict__ target, con
         committed[0] = blk + 1;
         count[0] = emitted + 1;
     }
+    pdl_launch();
 }
 
 // Choose how many drafts the next verification pass should cover and hand the answer to
@@ -264,6 +270,7 @@ extern "C" __global__ void glm_spec_accept(const float* __restrict__ target, con
 // rate in 1/256 units, [5] the L chosen last round. committed counts the anchor row, so
 // accepted drafts are committed - 1.
 extern "C" __global__ void glm_spec_pick(int* __restrict__ spec, unsigned long long h, int blk) {
+    pdl_wait();
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
     const int drafted = spec[5] > 0 ? spec[5] : blk;
     int accepted = spec[1] - 1;
@@ -279,30 +286,41 @@ extern "C" __global__ void glm_spec_pick(int* __restrict__ spec, unsigned long l
     if (l > blk) l = blk;
     spec[5] = l;
     cudaGraphSetConditional((cudaGraphConditionalHandle)h, (unsigned)(l - 1));
+    pdl_launch();
 }
 
 // Verification block for the graph capture: one row of context plus the drafted tokens,
 // built on device so no host round trip is needed between drafting and verification.
 extern "C" __global__ void glm_build_rows(int* rows, const int* tok, const int* draft, int n) {
+    pdl_wait();
     const int i = threadIdx.x + blockIdx.x * blockDim.x;
     if (i == 0) {
         rows[0] = tok[0];
     } else if (i <= n) {
         rows[i] = draft[i - 1];
     }
+    pdl_launch();
 }
 
 // Stage `n` consecutive positions starting at `base` on the device, so a speculative round can
 // advance the drafter's position without a host upload (which would stall a captured graph).
 extern "C" __global__ void glm_stage_pos(int* __restrict__ tob, int base, int n) {
+    pdl_wait();
     for (int i = threadIdx.x; i < n; i += blockDim.x) tob[i] = base + i;
+    pdl_launch();
 }
 
 // Restore the round's anchor position after the draft loop advanced `tob[0]`: the verify rows
 // were staged as [pos, pos+1, ...], so feeding row 0 back from row 1 keeps the buffer correct
 // on every graph replay (a host-side constant would be baked at capture time).
-extern "C" __global__ void glm_prev_pos(int* __restrict__ tob) { tob[0] = tob[1] - 1; }
+extern "C" __global__ void glm_prev_pos(int* __restrict__ tob) {
+    pdl_wait(); tob[0] = tob[1] - 1;
+    pdl_launch();
+}
 
 // Set the drafter row's position relative to the round's staged anchor (`tob[1]` holds pos+1),
 // so a captured graph replays with the live position instead of the capture-time constant.
-extern "C" __global__ void glm_stage_pos_rel(int* __restrict__ tob, int k) { tob[0] = tob[1] - 1 + k; }
+extern "C" __global__ void glm_stage_pos_rel(int* __restrict__ tob, int k) {
+    pdl_wait(); tob[0] = tob[1] - 1 + k;
+    pdl_launch();
+}

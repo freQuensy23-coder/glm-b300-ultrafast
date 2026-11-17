@@ -9,6 +9,10 @@
 #include <cstdint>
 
 #define DEV __device__ __forceinline__
+
+// Programmatic dependent launch: signal the following kernel as early as is safe.
+DEV void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+DEV void pdl_launch() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
 #define GMAX 16 // widest decode/verify row block (draft block + 1)
 
 using bf16 = __nv_bfloat16;

@@ -13,6 +13,7 @@ extern "C" __global__ void glm_router(const bf16* __restrict__ x, const uint8_t*
                                       int rows, int dim, int ne, int topk, int n_group, int topk_group, float scale,
                                       int* __restrict__ ids, float* __restrict__ wts, float* __restrict__ gscore,
                                       int sigmoid) {
+    pdl_wait();
     extern __shared__ char smem[];
     float* s = (float*)smem;   // ne scores
     float* red = s + ne;       // 8 reduction slots
@@ -101,12 +102,14 @@ extern "C" __global__ void glm_router(const bf16* __restrict__ x, const uint8_t*
         ids[row * topk + i] = sel[i];
         wts[row * topk + i] = (sum > 0.f ? s[sel[i]] / sum : 0.f) * scale;
     }
+    pdl_launch();
 }
 
 // Build per-expert token lists: offsets[ne+1] and idx[rows*topk] holding row*topk+slot.
 extern "C" __global__ void glm_route_lists(const int* __restrict__ ids, int rows, int topk, int ne,
                                            int* __restrict__ offsets, int* __restrict__ idx,
                                            int* __restrict__ cursor) {
+    pdl_wait();
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
     for (int e = 0; e <= ne; ++e) offsets[e] = 0;
     for (int i = 0; i < rows * topk; ++i) offsets[ids[i] + 1]++;
@@ -116,6 +119,7 @@ extern "C" __global__ void glm_route_lists(const int* __restrict__ ids, int rows
         const int e = ids[i];
         idx[cursor[e]++] = i;
     }
+    pdl_launch();
 }
 
 // h[p, inter] = silu(gate) * up for every token p assigned to expert blockIdx.x.
@@ -124,6 +128,7 @@ extern "C" __global__ void glm_moe_gate_up(bf16* __restrict__ h, const bf16* __r
                                            const uint8_t* __restrict__ w13, const float* __restrict__ sf13,
                                            const int* __restrict__ idx, const int* __restrict__ off, int topk,
                                            int dim, int inter) {
+    pdl_wait();
     extern __shared__ char smem[];
     float* sx = (float*)smem;
     const int e = blockIdx.x;
@@ -161,6 +166,7 @@ extern "C" __global__ void glm_moe_gate_up(bf16* __restrict__ h, const bf16* __r
         h[(size_t)p * inter + row] = f2b(silu(ag) * au);
         __syncthreads();
     }
+    pdl_launch();
 }
 
 // part[p, dim] = down_proj(h[p, :]) for the expert's token list.
@@ -168,6 +174,7 @@ extern "C" __global__ void glm_moe_down(float* __restrict__ part, const bf16* __
                                         const uint8_t* __restrict__ wd, const float* __restrict__ sfd,
                                         const int* __restrict__ idx, const int* __restrict__ off, int inter,
                                         int dim) {
+    pdl_wait();
     const int e = blockIdx.x;
     const int row = blockIdx.y * blockDim.x + threadIdx.x; // output dim row
     if (row >= dim) return;
@@ -186,18 +193,21 @@ extern "C" __global__ void glm_moe_down(float* __restrict__ part, const bf16* __
         }
         part[(size_t)p * dim + row] = acc;
     }
+    pdl_launch();
 }
 
 // y[token] = residual[token] + sum_slot wts * part[(token,slot)]
 extern "C" __global__ void glm_moe_reduce(bf16* __restrict__ y, const float* __restrict__ part,
                                           const float* __restrict__ wts, const bf16* __restrict__ residual, int rows,
                                           int topk, int dim) {
+    pdl_wait();
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < rows * dim; i += gridDim.x * blockDim.x) {
         const int r = i / dim, d = i % dim;
         float acc = 0.f;
         for (int s = 0; s < topk; ++s) acc = fmaf(wts[r * topk + s], part[(size_t)(r * topk + s) * dim + d], acc);
         y[i] = f2b(b2f(residual[i]) + acc);
     }
+    pdl_launch();
 }
 
 // Epilogue for the tcgen05 MoE path: that path writes one row per (token, slot) pair in the
@@ -205,6 +215,7 @@ extern "C" __global__ void glm_moe_reduce(bf16* __restrict__ y, const float* __r
 // `out` and `resid` are bf16 rows (the residual stream); ypair is f32 per (token, slot).
 extern "C" __global__ void glm_moe_reduce_pair(bf16* out, const float* ypair, const int* pair_row,
                                                const float* w, const bf16* resid, int m, int topk, int dim) {
+    pdl_wait();
     const int i = blockIdx.x;
     const int c = blockIdx.y * blockDim.x + threadIdx.x;
     if (i >= m || c >= dim) return;
@@ -215,6 +226,7 @@ extern "C" __global__ void glm_moe_reduce_pair(bf16* out, const float* ypair, co
         acc += ypair[(size_t)r * dim + c] * w[slot];
     }
     out[(size_t)i * dim + c] = f2b(b2f(resid[(size_t)i * dim + c]) + acc);
+    pdl_launch();
 }
 
 // Short-chain MoE for a handful of rows: one CTA per (token, slot) computes both projections of
@@ -225,6 +237,7 @@ extern "C" __global__ void glm_moe_sgl(float* __restrict__ out, float* __restric
                                        const float* __restrict__ sf13, const uint8_t* __restrict__ w2,
                                        const float* __restrict__ sf2, const int* __restrict__ ids,
                                        const float* __restrict__ wts, int m, int topk, int dim, int inter) {
+    pdl_wait();
     const int r = blockIdx.x;
     if (r >= m * topk) return;
     const int tok = r / topk, slot = r - tok * topk;
@@ -294,4 +307,5 @@ extern "C" __global__ void glm_moe_sgl(float* __restrict__ out, float* __restric
     }
     (void)out;
     (void)w;
+    pdl_launch();
 }

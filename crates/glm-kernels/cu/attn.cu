@@ -135,6 +135,7 @@ static __device__ void decode_body(const bf16* __restrict__ q, const uint8_t* __
 // Merge the split partials and write bf16 attention output.
 extern "C" __global__ void glm_attn_combine(const float* __restrict__ part, bf16* __restrict__ out, int rows, int nq,
                                             int hd, int nsplits) {
+    pdl_wait();
     const int h = blockIdx.x, row = blockIdx.y;
     const float* base = part + ((size_t)row * nq + h) * nsplits * (hd + 2);
     __shared__ float sm, sl;
@@ -162,6 +163,7 @@ extern "C" __global__ void glm_attn_combine(const float* __restrict__ part, bf16
         }
         o[d] = f2b(acc / sl);
     }
+    pdl_launch();
 }
 
 extern "C" __global__ void glm_attn_decode_split(const bf16* __restrict__ q, const bf16* __restrict__ kc,
@@ -169,8 +171,10 @@ extern "C" __global__ void glm_attn_decode_split(const bf16* __restrict__ q, con
                                                 const int* __restrict__ pos, int rows, int max_seq, int nq,
                                                 int nkv, int hd, float scale, int window, int split,
                                                 int nsplits, int gqa) {
+    pdl_wait();
     decode_body<0>(q, (const uint8_t*)kc, (const uint8_t*)vc, nullptr, nullptr, part, pos, rows,
                        max_seq, nq, nkv, hd, scale, window, split, nsplits, gqa);
+    pdl_launch();
 }
 
 // fp8 KV: payload is e4m3 with one e8m0 scale per 32 values, so the cache costs half the
@@ -181,8 +185,10 @@ extern "C" __global__ void glm_attn_decode_split_q8(const bf16* __restrict__ q, 
                                                    const int* __restrict__ pos, int rows, int max_seq, int nq,
                                                    int nkv, int hd, float scale, int window, int split,
                                                    int nsplits, int gqa) {
+    pdl_wait();
     decode_body<1>(q, kc, vc, ks, vs, part, pos, rows, max_seq, nq, nkv, hd, scale, window, split,
                       nsplits, gqa);
+    pdl_launch();
 }
 
 // Causal prefill: one CTA per (head, TQ query rows). Q, K, V tiles live in shared
@@ -278,8 +284,10 @@ extern "C" __global__ void glm_attn_prefill(const bf16* __restrict__ q, const bf
                                            const bf16* __restrict__ vc, bf16* __restrict__ out,
                                            const int* __restrict__ pos, int rows, int max_seq, int nq, int nkv,
                                            int hd, float scale, int window, int gqa) {
+    pdl_wait();
     prefill_body<0>(q, (const uint8_t*)kc, (const uint8_t*)vc, nullptr, nullptr, out, pos, rows,
                         max_seq, nq, nkv, hd, scale, window, gqa);
+    pdl_launch();
 }
 
 extern "C" __global__ void glm_attn_prefill_q8(const bf16* __restrict__ q, const uint8_t* __restrict__ kc,
@@ -287,7 +295,9 @@ extern "C" __global__ void glm_attn_prefill_q8(const bf16* __restrict__ q, const
                                                const uint8_t* __restrict__ vs, bf16* __restrict__ out,
                                                const int* __restrict__ pos, int rows, int max_seq, int nq,
                                                int nkv, int hd, float scale, int window, int gqa) {
+    pdl_wait();
     prefill_body<1>(q, kc, vc, ks, vs, out, pos, rows, max_seq, nq, nkv, hd, scale, window, gqa);
+    pdl_launch();
 }
 
 extern "C" __global__ void glm_attn_decode_split_q4(const bf16* __restrict__ q, const uint8_t* __restrict__ kc,
@@ -296,8 +306,10 @@ extern "C" __global__ void glm_attn_decode_split_q4(const bf16* __restrict__ q, 
                                                    const int* __restrict__ pos, int rows, int max_seq, int nq,
                                                    int nkv, int hd, float scale, int window, int split,
                                                    int nsplits, int gqa) {
+    pdl_wait();
     decode_body<2>(q, kc, vc, ks, vs, part, pos, rows, max_seq, nq, nkv, hd, scale, window, split,
                    nsplits, gqa);
+    pdl_launch();
 }
 
 extern "C" __global__ void glm_attn_prefill_q4(const bf16* __restrict__ q, const uint8_t* __restrict__ kc,
@@ -305,5 +317,7 @@ extern "C" __global__ void glm_attn_prefill_q4(const bf16* __restrict__ q, const
                                                const uint8_t* __restrict__ vs, bf16* __restrict__ out,
                                                const int* __restrict__ pos, int rows, int max_seq, int nq,
                                                int nkv, int hd, float scale, int window, int gqa) {
+    pdl_wait();
     prefill_body<2>(q, kc, vc, ks, vs, out, pos, rows, max_seq, nq, nkv, hd, scale, window, gqa);
+    pdl_launch();
 }

@@ -24,7 +24,7 @@ const MODULES: &[(&str, &[&str])] = &[
             "glm_cast_f32_bf16",
             "glm_cat2",
             "glm_embed",
-            "glm_kv_append", "glm_kv_append_q8", "glm_kv_append_q4",
+            "glm_rope_kv", "glm_kv_append", "glm_kv_append_q8", "glm_kv_append_q4",
             "glm_zero_f32",
             "glm_add_bias",
             "glm_copy_bf16",

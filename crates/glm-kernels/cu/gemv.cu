@@ -12,6 +12,7 @@
 extern "C" __global__ void glm_gemv_fp8(const uint8_t* __restrict__ w, const float* __restrict__ sf,
                                         const bf16* __restrict__ x, float* __restrict__ y, int n, int k,
                                         int m, int ld_x, int ld_y) {
+    pdl_wait();
     __shared__ float shx[GMAX][128];
     __shared__ bf16 shb[GMAX][128]; // cp.async landing zone: raw bf16, converted on use
     __shared__ float red[4][64][GMAX];
@@ -73,11 +74,13 @@ extern "C" __global__ void glm_gemv_fp8(const uint8_t* __restrict__ w, const flo
             y[(size_t)t * ld_y + blockIdx.x * 64 + rp] = v;
         }
     }
+    pdl_launch();
 }
 
 // Same shape, bf16 weights (used for the lm_head and any layer left unquantized).
 extern "C" __global__ void glm_gemv_bf16(const bf16* __restrict__ w, const bf16* __restrict__ x, float* __restrict__ y,
                                          int n, int k, int m, int ld_x, int ld_y) {
+    pdl_wait();
     __shared__ float shx[GMAX][128];
     __shared__ bf16 shb[GMAX][128]; // cp.async landing zone: raw bf16, converted on use
     __shared__ float red[4][64][GMAX];
@@ -125,6 +128,7 @@ extern "C" __global__ void glm_gemv_bf16(const bf16* __restrict__ w, const bf16*
             y[(size_t)t * ld_y + blockIdx.x * 64 + rp] = red[0][rp][t] + red[1][rp][t] + red[2][rp][t] + red[3][rp][t];
         }
     }
+    pdl_launch();
 }
 
 // --------------------------------------------------------------- prefill GEMM
@@ -133,6 +137,7 @@ extern "C" __global__ void glm_gemv_bf16(const bf16* __restrict__ w, const bf16*
 extern "C" __global__ void glm_gemm_fp8(const uint8_t* __restrict__ w, const float* __restrict__ sf,
                                         const bf16* __restrict__ x, float* __restrict__ y, int n, int k, int m,
                                         int ld_x, int ld_y) {
+    pdl_wait();
     __shared__ float sha[32][32]; // token x k-chunk
     __shared__ float shb[64][32]; // row   x k-chunk
     const int tid = threadIdx.x;
@@ -180,6 +185,7 @@ extern "C" __global__ void glm_gemm_fp8(const uint8_t* __restrict__ w, const flo
 #pragma unroll
         for (int i = 0; i < 8; ++i) y[(size_t)(t0 + tok) * ld_y + r0 + rgrp + i] = acc[i];
     }
+    pdl_launch();
 }
 
 static DEV float e2m1_v(uint8_t nib) {
@@ -193,6 +199,7 @@ static DEV float e2m1_v(uint8_t nib) {
 extern "C" __global__ void glm_gemv_fp4(const uint8_t* __restrict__ w, const uint8_t* __restrict__ sf,
                                         const bf16* __restrict__ x, float* __restrict__ y, int n, int k,
                                         int m, int ld_x, int ld_y) {
+    pdl_wait();
     __shared__ float shx[GMAX][32];
     __shared__ bf16 shb[GMAX][32];
     __shared__ float red[4][64][GMAX];
@@ -243,4 +250,5 @@ extern "C" __global__ void glm_gemv_fp4(const uint8_t* __restrict__ w, const uin
             y[(size_t)t * ld_y + r] = v;
         }
     }
+    pdl_launch();
 }

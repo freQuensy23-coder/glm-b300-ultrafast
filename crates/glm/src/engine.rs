@@ -303,6 +303,18 @@ impl Engine {
         self.launch("glm_rope_qk", Launch::new((total as u32).div_ceil(256).min(4096).max(1), 256), &mut a)
     }
 
+    /// Rotate Q in place and append rope'd K plus V to the bf16 cache in a single pass.
+    fn rope_kv_append(&self, slot: usize, m: usize) -> Result<()> {
+        let (kc, vc) = self.kv.ptrs(slot);
+        let c = &self.cfg;
+        let mut a = Args::new();
+        a.ptr(self.b.q.ptr).ptr(self.b.kn.ptr).ptr(self.b.vn.ptr).ptr(kc).ptr(vc).ptr(self.b.tob.ptr)
+            .i32(m as i32).i32(c.n_heads as i32).i32(c.n_kv as i32).i32(c.head_dim as i32)
+            .i32(c.rope_dim as i32).f32(c.rope_theta).i32(self.kv.max_seq as i32);
+        let total = (m * (c.n_heads * (c.rope_dim / 2) + c.n_kv * c.head_dim)) as u32;
+        self.launch("glm_rope_kv", Launch::new(total.div_ceil(256).max(1).min(4096), 256), &mut a)
+    }
+
     fn kv_append(&self, slot: usize, _start: usize, m: usize) -> Result<()> {
         let (kc, vc) = self.kv.ptrs(slot);
         let total = (m * self.cfg.n_kv * self.cfg.head_dim / 8) as u32;
@@ -579,8 +591,13 @@ impl Engine {
         }
         self.norm_heads(self.b.q.ptr, layer.q_norm.ptr, c.n_heads, m)?;
         self.norm_heads(self.b.kn.ptr, layer.k_norm.ptr, c.n_kv, m)?;
-        self.rope(self.b.q.ptr, self.b.kn.ptr, m)?;
-        self.kv_append(slot, start, m)?;
+        if self.kv.mode == crate::cache::KvMode::Bf16 {
+            // one launch rotates Q, rotates K and appends both rows to the cache
+            self.rope_kv_append(slot, m)?;
+        } else {
+            self.rope(self.b.q.ptr, self.b.kn.ptr, m)?;
+            self.kv_append(slot, start, m)?;
+        }
         if prefill {
             self.attn_prefill(slot, start, m)?;
         } else {

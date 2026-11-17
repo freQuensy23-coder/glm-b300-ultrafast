@@ -4,6 +4,7 @@
 // out[r, :] = rmsnorm(x[r, :]) * w[:]   (bf16 in/out, fp32 accumulation)
 extern "C" __global__ void glm_rmsnorm(const bf16* __restrict__ x, const bf16* __restrict__ w, bf16* __restrict__ out,
                                        int rows, int dim, float eps, int ld_x, int ld_out) {
+    pdl_wait();
     __shared__ float sv[8];
     const int r = blockIdx.x;
     if (r >= rows) return;
@@ -20,11 +21,13 @@ extern "C" __global__ void glm_rmsnorm(const bf16* __restrict__ x, const bf16* _
     bf16* o = out + (size_t)r * ld_out;
     const float s = scale;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) o[i] = f2b(b2f(xr[i]) * s * b2f(w[i]));
+    pdl_launch();
 }
 
 // Per-head RMSNorm used on q and k (GLM applies qk-norm over head_dim).
 extern "C" __global__ void glm_rmsnorm_heads(const bf16* __restrict__ x, const bf16* __restrict__ w,
                                              bf16* __restrict__ out, int heads, int hd, float eps) {
+    pdl_wait();
     __shared__ float sv[8];
     const int h = blockIdx.x;
     const int row = blockIdx.y;
@@ -41,12 +44,15 @@ extern "C" __global__ void glm_rmsnorm_heads(const bf16* __restrict__ x, const b
     bf16* o = out + ((size_t)row * heads + h) * hd;
     const float s = scale;
     for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = f2b(b2f(xr[i]) * s * b2f(w[i]));
+    pdl_launch();
 }
 
 // Half-split RoPE over the first `rot` lanes of each head; positions come from `pos`.
 extern "C" __global__ void glm_rope_qk(bf16* __restrict__ q, bf16* __restrict__ k, const int* __restrict__ pos,
                                        int rows, int nq, int nkv, int hd, int rot, float theta) {
+    pdl_wait();
     const int half = rot >> 1;
+    const float lgt = log2f(theta);
     const int total = rows * (nq + nkv);
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total * half; idx += gridDim.x * blockDim.x) {
         int e = idx % half;
@@ -65,55 +71,117 @@ extern "C" __global__ void glm_rope_qk(bf16* __restrict__ q, bf16* __restrict__ 
             base = k + ((size_t)row * nkv + head) * hd;
         }
         const float p = (float)pos[row];
-        const float freq = p / powf(theta, (float)(2 * e) / (float)rot);
-        const float c = cosf(freq), s = sinf(freq);
+        const float freq = p * exp2f(-(float)(2 * e) / (float)rot * lgt);
+        float c, s;
+        __sincosf(freq, &s, &c);
         float a = b2f(base[e]), b = b2f(base[e + half]);
         base[e] = f2b(a * c - b * s);
         base[e + half] = f2b(b * c + a * s);
     }
+    pdl_launch();
 }
 
 // out = silu(gate) * up
 extern "C" __global__ void glm_swiglu_mul(bf16* __restrict__ out, const float* __restrict__ gate,
                                           const float* __restrict__ up, int n) {
+    pdl_wait();
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
         out[i] = f2b(silu(gate[i]) * up[i]);
+    pdl_launch();
 }
 
 // h += y  (h is the bf16 residual stream, y an fp32 projection result)
 extern "C" __global__ void glm_add_residual(bf16* __restrict__ h, const float* __restrict__ y, int n) {
+    pdl_wait();
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) h[i] = f2b(b2f(h[i]) + y[i]);
+    pdl_launch();
 }
 
 // dst[t, :] = src[t, :] (fp32 -> bf16), used to feed projections into norm/rope
 extern "C" __global__ void glm_cast_f32_bf16(bf16* __restrict__ dst, const float* __restrict__ src, int n) {
+    pdl_wait();
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) dst[i] = f2b(src[i]);
+    pdl_launch();
 }
 
 // dst = a || b along the last axis (MTP fuses embedding and hidden state)
 extern "C" __global__ void glm_cat2(bf16* __restrict__ dst, const bf16* __restrict__ a, const bf16* __restrict__ b,
                                     int rows, int da, int db) {
+    pdl_wait();
     const int d = da + db;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < rows * d; idx += gridDim.x * blockDim.x) {
         int r = idx / d, i = idx % d;
         dst[idx] = (i < da) ? a[(size_t)r * da + i] : b[(size_t)r * db + i - da];
     }
+    pdl_launch();
 }
 
 // Embedding lookup: out[t, :] = table[id[t], :]
 extern "C" __global__ void glm_embed(bf16* __restrict__ out, const bf16* __restrict__ table,
                                      const int* __restrict__ ids, int rows, int dim) {
+    pdl_wait();
     const int r = blockIdx.x;
     if (r >= rows) return;
     const bf16* src = table + (size_t)ids[r] * dim;
     bf16* dst = out + (size_t)r * dim;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) dst[i] = src[i];
+    pdl_launch();
 }
 
 // KV cache layout: kcache[nkv][max_seq][hd], vcache[nkv][max_seq][hd].
+
+// Fused interleaved-rope + KV append: rotates Q in place, rotates K on the fly and writes both
+// K and V into the bf16 cache. Replaces glm_rope_qk + glm_kv_append for the bf16 KV mode, so a
+// layer issues one launch and one round-trip instead of three.
+extern "C" __global__ void glm_rope_kv(bf16* __restrict__ q, const bf16* __restrict__ k,
+                                      const bf16* __restrict__ v, bf16* __restrict__ kc,
+                                      bf16* __restrict__ vc, const int* __restrict__ pos,
+                                      int rows, int nq, int nkv, int hd, int rot, float theta,
+                                      int max_seq) {
+    pdl_wait();
+    const int half = rot >> 1;
+    const float lgt = log2f(theta);
+    const int qtotal = rows * nq * half;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < qtotal; idx += gridDim.x * blockDim.x) {
+        const int e = idx % half;
+        const int t = idx / half;
+        const int r = t / nq, head = t % nq;
+        bf16* base = q + ((size_t)r * nq + head) * hd;
+        const float ang = (float)pos[r] * exp2f(-(float)(2 * e) / (float)rot * lgt);
+        float c, s;
+        __sincosf(ang, &s, &c);
+        const float a = b2f(base[e]), b = b2f(base[e + half]);
+        base[e] = f2b(a * c - b * s);
+        base[e + half] = f2b(b * c + a * s);
+    }
+    // one thread per element of the K/V rows, coalesced across the head dimension
+    const int kvt = rows * nkv * hd;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < kvt; i += gridDim.x * blockDim.x) {
+        const int lane = i % hd;
+        const int t = (i / hd) % nkv;
+        const int r = i / (hd * nkv);
+        const size_t src = ((size_t)r * nkv + t) * hd + lane;
+        const size_t dst = ((size_t)t * max_seq + pos[0] + r) * hd + lane;
+        float kv = b2f(k[src]);
+        if (lane < rot) {
+            const int e = lane < half ? lane : lane - half;
+            bf16* pair = (bf16*)(k + src - lane) + e;
+            const float ang = (float)pos[r] * exp2f(-(float)(2 * e) / (float)rot * lgt);
+            float c, s;
+            __sincosf(ang, &s, &c);
+            const float a = b2f(pair[0]), b = b2f(pair[half]);
+            kv = lane < half ? a * c - b * s : b * c + a * s;
+        }
+        kc[dst] = f2b(kv);
+        vc[dst] = v[src];
+    }
+    pdl_launch();
+}
+
 extern "C" __global__ void glm_kv_append(bf16* __restrict__ kc, bf16* __restrict__ vc, const bf16* __restrict__ k,
                                          const bf16* __restrict__ v, const int* __restrict__ pos, int rows,
                                          int nkv, int hd, int max_seq) {
+    pdl_wait();
     // `pos` is a device array of absolute positions, so a captured graph replays at any
     // offset without its kernel arguments changing.
     const int p0 = pos[0];
@@ -128,23 +196,30 @@ extern "C" __global__ void glm_kv_append(bf16* __restrict__ kc, bf16* __restrict
         *(uint4*)(kc + dst) = *(const uint4*)(k + src);
         *(uint4*)(vc + dst) = *(const uint4*)(v + src);
     }
+    pdl_launch();
 }
 
 extern "C" __global__ void glm_zero_f32(float* __restrict__ p, int n) {
+    pdl_wait();
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) p[i] = 0.f;
+    pdl_launch();
 }
 
 // dst[t, :len] += bias[:len] for `rows` rows laid out with stride `ld`.
 extern "C" __global__ void glm_add_bias(bf16* __restrict__ dst, const bf16* __restrict__ bias, int rows, int ld,
                                         int len) {
+    pdl_wait();
     const int r = blockIdx.x;
     if (r >= rows) return;
     bf16* d = dst + (size_t)r * ld;
     for (int i = threadIdx.x; i < len; i += blockDim.x) d[i] = f2b(b2f(d[i]) + b2f(bias[i]));
+    pdl_launch();
 }
 
 extern "C" __global__ void glm_copy_bf16(bf16* __restrict__ dst, const bf16* __restrict__ src, int n) {
+    pdl_wait();
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) dst[i] = src[i];
+    pdl_launch();
 }
 
 // fp8 variant of the KV append: same positions-in-device-memory contract, e4m3 payload with
@@ -154,6 +229,7 @@ extern "C" __global__ void glm_kv_append_q8(uint8_t* __restrict__ kc, uint8_t* _
                                             const bf16* __restrict__ k, const bf16* __restrict__ v,
                                             const int* __restrict__ pos, int rows, int nkv, int hd,
                                             int max_seq) {
+    pdl_wait();
     const int r = blockIdx.x / nkv, h = blockIdx.x % nkv;
     if (r >= rows) return;
     const int p = pos[0] + r;
@@ -179,6 +255,7 @@ extern "C" __global__ void glm_kv_append_q8(uint8_t* __restrict__ kc, uint8_t* _
         ks[sdst + kb] = (uint8_t)(ek + 127);
         vs[sdst + kb] = (uint8_t)(ev + 127);
     }
+    pdl_launch();
 }
 
 static DEV uint8_t e2m1_code(float x) {
@@ -200,6 +277,7 @@ extern "C" __global__ void glm_kv_append_q4(uint8_t* __restrict__ kc, uint8_t* _
                                             const bf16* __restrict__ k, const bf16* __restrict__ v,
                                             const int* __restrict__ pos, int rows, int nkv, int hd,
                                             int max_seq) {
+    pdl_wait();
     const int r = blockIdx.x / nkv, h = blockIdx.x % nkv;
     if (r >= rows) return;
     const int p = pos[0] + r;
@@ -227,4 +305,5 @@ extern "C" __global__ void glm_kv_append_q4(uint8_t* __restrict__ kc, uint8_t* _
         ks[sdst + kb] = (uint8_t)(ek + 127);
         vs[sdst + kb] = (uint8_t)(ev + 127);
     }
+    pdl_launch();
 }
