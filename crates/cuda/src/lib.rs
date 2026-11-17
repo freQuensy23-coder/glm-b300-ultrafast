@@ -333,6 +333,9 @@ impl Stream {
         ck!(sys::cuStreamEndCapture(self.raw, &mut g))?;
         Ok(Graph { raw: g })
     }
+    /// `g` is an opaque driver handle, not a dereferenced pointer — clippy cannot see that
+    /// through the `ck!` macro.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn begin_capture_into(&self, g: sys::CUgraph) -> Result<()> {
         ck!(sys::cuStreamBeginCaptureToGraph(self.raw, g, null(), null(), 0, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL))
     }
