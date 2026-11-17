@@ -262,7 +262,7 @@ extern "C" __global__ void glm_rope_kv_q8(uint8_t* __restrict__ kc, uint8_t* __r
                 const int e = col < half ? col : col - half;
                 const bf16* head = k + src;
                 const float aa = b2f(head[e]), bb2 = b2f(head[e + half]);
-                const float ang = (float)p * exp2f(-(float)(2 * e) / (float)rot * lgt);
+                const float ang = (float)pos[r] * exp2f(-(float)(2 * e) / (float)rot * lgt);
                 float c, s;
                 __sincosf(ang, &s, &c);
                 kvv = col < half ? aa * c - bb2 * s : bb2 * c + aa * s;
@@ -371,7 +371,7 @@ extern "C" __global__ void glm_rope_kv_q4(uint8_t* __restrict__ kc, uint8_t* __r
                 const int e = col < half ? col : col - half;
                 const bf16* head = k + src;
                 const float aa = b2f(head[e]), bb2 = b2f(head[e + half]);
-                const float ang = (float)p * exp2f(-(float)(2 * e) / (float)rot * lgt);
+                const float ang = (float)pos[r] * exp2f(-(float)(2 * e) / (float)rot * lgt);
                 float c, s;
                 __sincosf(ang, &s, &c);
                 kvv = col < half ? aa * c - bb2 * s : bb2 * c + aa * s;

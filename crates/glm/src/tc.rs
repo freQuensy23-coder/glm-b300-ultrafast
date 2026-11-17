@@ -109,6 +109,7 @@ pub struct QmxParams {
 /// contract.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+#[allow(non_snake_case)] // field names are the C definition's
 pub struct GemvParams {
     pub w: u64,
     pub ws: u64,
@@ -172,6 +173,7 @@ const _: () = assert!(std::mem::size_of::<GemvParams>() == 432);
 /// Mirror of `Tg2Params` in tcgemv2.cu (352 bytes) — the second-generation tensor-core GEMV.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+#[allow(non_snake_case)]
 pub struct Tg2Params {
     pub tmap: u64,
     pub sfa: u64,

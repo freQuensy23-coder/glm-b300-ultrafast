@@ -207,7 +207,7 @@ impl Linear {
             Fmt::Fp4 => "glm_gemv_fp4",
             Fmt::Bf16 => "glm_gemv_bf16",
         };
-        cu::launch(k.get(name)?, &Launch::new(grid, 256), s, &mut a)
+        cu::launch(k.get(name)?, &Launch::new(grid, 256).pdl(true), s, &mut a)
     }
 
     /// Prefill path; bf16 layers fall back to the decode GEMV.
@@ -239,7 +239,7 @@ impl Linear {
         a.ptr(self.w).ptr(self.sf.unwrap()).ptr(x).ptr(y);
         a.i32(self.n as i32).i32(self.k as i32).i32(m as i32).i32(ld_x as i32).i32(ld_y as i32);
         let grid = ((self.n / 64) as u32, m.div_ceil(32) as u32, 1);
-        cu::launch(k.get("glm_gemm_fp8")?, &Launch::new(1, 256).grid3(grid), s, &mut a)
+        cu::launch(k.get("glm_gemm_fp8")?, &Launch::new(1, 256).grid3(grid).pdl(true), s, &mut a)
     }
 }
 

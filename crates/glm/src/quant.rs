@@ -527,4 +527,40 @@ mod fp4_tests {
         // the w13 payload is the interleaved gate/up nibbles, so row 0 must carry gate row 0
         assert_eq!(&w13[..dim / 2], &g.w[..dim / 2], "w13 row 0 is not gate row 0");
     }
+
+    /// The fused rope+append kernel rotates K lane by lane instead of rotating the whole head
+    /// first, so its pair indexing has to agree with the reference rotation exactly.
+    #[test]
+    fn fused_rope_lane_formula_matches_reference_rotation() {
+        let (hd, rot, theta) = (128usize, 64usize, 1e4f32);
+        let half = rot / 2;
+        let head: Vec<f32> = (0..hd).map(|i| (i as f32 * 0.37).sin()).collect();
+        for pos in [0usize, 1, 7, 4095] {
+            // reference: rotate the pairs (e, e + half) for e < half
+            let mut want = head.clone();
+            for e in 0..half {
+                let ang = pos as f32 / theta.powf(2.0 * e as f32 / rot as f32);
+                let (c, s) = (ang.cos(), ang.sin());
+                let (a, b) = (head[e], head[e + half]);
+                want[e] = a * c - b * s;
+                want[e + half] = b * c + a * s;
+            }
+            // fused: one thread per lane, as `glm_rope_kv*` computes it
+            let mut got = head.clone();
+            for col in 0..rot {
+                let e = if col < half { col } else { col - half };
+                let ang = pos as f32 / theta.powf(2.0 * e as f32 / rot as f32);
+                let (c, s) = (ang.cos(), ang.sin());
+                let (a, b) = (head[e], head[e + half]);
+                got[col] = if col < half { a * c - b * s } else { b * c + a * s };
+            }
+            for col in 0..rot {
+                assert!((want[col] - got[col]).abs() <= 1e-6, "col {col} pos {pos}");
+            }
+            // lanes past the rotated window are copied untouched
+            for col in rot..hd {
+                assert_eq!(want[col], got[col]);
+            }
+        }
+    }
 }

@@ -297,6 +297,8 @@ impl Engine {
         self.launch("glm_rmsnorm_heads", Launch::new(heads as u32, 128).grid3((heads as u32, m as u32, 1)), &mut a)
     }
 
+    /// Kept for callers that need rotation without an append (the fused path supersedes it).
+    #[allow(dead_code)]
     fn rope(&self, q: DevPtr, k: DevPtr, m: usize) -> Result<()> {
         let half = self.cfg.rope_dim / 2;
         let total = m * (self.cfg.n_heads + self.cfg.n_kv) * half;
@@ -329,6 +331,7 @@ impl Engine {
         self.launch(name, Launch::new(((m * c.n_kv) as u32).max(1), 128), &mut a)
     }
 
+    #[allow(dead_code)]
     fn kv_append(&self, slot: usize, _start: usize, m: usize) -> Result<()> {
         let (kc, vc) = self.kv.ptrs(slot);
         let total = (m * self.cfg.n_kv * self.cfg.head_dim / 8) as u32;
@@ -527,7 +530,7 @@ impl Engine {
     /// runs after the routed reduce on the same stream (it is not yet overlapped).
     fn moe_tc(
         &self,
-        layer: &Layer,
+        _layer: &Layer,
         tc: &crate::tcmoe::TcMoe,
         shared: Option<&(Linear, Linear, Linear)>,
         hn: DevPtr,

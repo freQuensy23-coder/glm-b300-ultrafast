@@ -225,7 +225,7 @@ impl TcMoe {
             tiles: io.tiles.ptr,
             ntiles: io.ntiles.ptr,
         };
-        cu::launch(kern.get("moe_perm")?, &cu::Launch::new(1, 1024), s, cu::Args::new().push(mp))?;
+        cu::launch(kern.get("moe_perm")?, &cu::Launch::new(1, 1024).pdl(true), s, cu::Args::new().push(mp))?;
 
         let gq = GqParams {
             x: h,
@@ -241,7 +241,7 @@ impl TcMoe {
         };
         cu::launch(
             kern.get("glm_gather_quant")?,
-            &cu::Launch::new(slots as u32, 256),
+            &cu::Launch::new(slots as u32, 256).pdl(true),
             s,
             cu::Args::new().push(gq),
         )?;
@@ -289,14 +289,14 @@ impl TcMoe {
         for (name, p) in [("tc_moe_w13_rm2", w13), ("tc_moe_w2_rm", w2)] {
             let f = kern.get(name)?;
             f.set_max_dynamic_smem(TM_SMEM)?;
-            cu::launch(f, &cu::Launch::new(sms, 512).smem(TM_SMEM), s, cu::Args::new().push(p))?;
+            cu::launch(f, &cu::Launch::new(sms, 512).smem(TM_SMEM).pdl(true), s, cu::Args::new().push(p))?;
         }
 
         let mut a = cu::Args::new();
         a.ptr(out).ptr(io.ypair.ptr).ptr(io.pair_row.ptr).ptr(io.row_w.ptr).ptr(out).i32(m as i32).i32(topk as i32).i32(dim as i32);
         cu::launch(
             kern.get("glm_moe_reduce_pair")?,
-            &cu::Launch::new(m as u32, 256).grid3((m as u32, (dim as u32).div_ceil(256), 1)),
+            &cu::Launch::new(m as u32, 256).grid3((m as u32, (dim as u32).div_ceil(256), 1)).pdl(true),
             s,
             &mut a,
         )
