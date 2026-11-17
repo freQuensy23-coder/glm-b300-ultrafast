@@ -259,7 +259,7 @@ impl TcWeight {
             ..Default::default()
         };
         let gx = (self.n / 128) as u32;
-        let mut cfg = cu::Launch::new(gx, 128).grid3((gx, self.cs as u32, 1)).smem(self.smem as u32);
+        let mut cfg = cu::Launch::new(gx, 128).grid3((gx, self.cs as u32, 1)).smem(self.smem as u32).pdl(true);
         cfg.cluster = Some((1, self.cs as u32, 1));
         cu::launch(f, &cfg, s, cu::Args::new().push(p))
     }
@@ -426,7 +426,7 @@ impl TcWeight {
             ..Default::default()
         };
         let gx = (self.n / 128) as u32;
-        let mut cfg = cu::Launch::new(gx, 128).grid3((gx, self.cs as u32, 1)).smem(self.smem as u32);
+        let mut cfg = cu::Launch::new(gx, 128).grid3((gx, self.cs as u32, 1)).smem(self.smem as u32).pdl(true);
         cfg.cluster = Some((1, self.cs as u32, 1));
         cu::launch(f, &cfg, s, cu::Args::new().push(p))
     }
@@ -504,7 +504,7 @@ impl TcWeight {
         f.set_max_dynamic_smem(smem)?;
         let gx = (self.n / 128) as u32;
         let mt = (m as u32).div_ceil(128);
-        cu::launch(f, &cu::Launch::new(gx, 128).grid3((gx, mt, 1)).smem(smem), s, cu::Args::new().push(gp))
+        cu::launch(f, &cu::Launch::new(gx, 128).grid3((gx, mt, 1)).smem(smem).pdl(true), s, cu::Args::new().push(gp))
     }
 
     /// Quantize bf16 activations and run the decode GEMV in one call.
@@ -575,6 +575,6 @@ pub fn quant_mx_into(
         eps: norm.map_or(0.0, |n| n.1),
         norm: i32::from(norm.is_some()),
     };
-    let cfg = cu::Launch::new(rows as u32, 256);
+    let cfg = cu::Launch::new(rows as u32, 256).pdl(true);
     cu::launch(kern.get("glm_quant_mx")?, &cfg, s, cu::Args::new().push(p))
 }

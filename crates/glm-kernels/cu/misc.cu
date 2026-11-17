@@ -224,6 +224,67 @@ extern "C" __global__ void glm_copy_bf16(bf16* __restrict__ dst, const bf16* __r
 
 // fp8 variant of the KV append: same positions-in-device-memory contract, e4m3 payload with
 // one power-of-two e8m0 scale per 32 values along the head dimension.
+extern "C" __global__ void glm_rope_kv_q8(uint8_t* __restrict__ kc, uint8_t* __restrict__ vc,
+                                            uint8_t* __restrict__ ks, uint8_t* __restrict__ vs,
+                                            bf16* __restrict__ q, const bf16* __restrict__ k,
+                                            const bf16* __restrict__ v, const int* __restrict__ pos,
+                                            int rows, int nq, int nkv, int hd, int rot, float theta,
+                                            int max_seq) {
+    pdl_wait();
+    const float lgt = log2f(theta);
+    const int half = rot >> 1;
+    // rotate Q in place; K is rotated on the fly below, so it is never written back
+    const int qtotal = rows * nq * half;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < qtotal; idx += gridDim.x * blockDim.x) {
+        const int e = idx % half, t = idx / half;
+        const int qr = t / nq, qh = t % nq;
+        bf16* qb = q + ((size_t)qr * nq + qh) * hd;
+        const float ang = (float)pos[qr] * exp2f(-(float)(2 * e) / (float)rot * lgt);
+        float c, s;
+        __sincosf(ang, &s, &c);
+        const float a = b2f(qb[e]), bb = b2f(qb[e + half]);
+        qb[e] = f2b(a * c - bb * s);
+        qb[e + half] = f2b(bb * c + a * s);
+    }
+    const int r = blockIdx.x / nkv, h = blockIdx.x % nkv;
+    if (r >= rows) return;
+    const int p = pos[0] + r;
+    const size_t src = ((size_t)r * nkv + h) * hd;
+    const size_t dst = ((size_t)h * max_seq + p) * hd;
+    const size_t sdst = ((size_t)h * max_seq + p) * (hd / 32);
+    for (int kb = threadIdx.x; kb < hd / 32; kb += blockDim.x) {
+        float ak[32], av[32];
+        float mk = 0.f, mv = 0.f;
+        for (int j = 0; j < 32; ++j) {
+            const int col = kb * 32 + j;
+            float kvv = b2f(k[src + col]);
+            if (col < rot) {
+                const int e = col < half ? col : col - half;
+                const bf16* head = k + src;
+                const float aa = b2f(head[e]), bb2 = b2f(head[e + half]);
+                const float ang = (float)p * exp2f(-(float)(2 * e) / (float)rot * lgt);
+                float c, s;
+                __sincosf(ang, &s, &c);
+                kvv = col < half ? aa * c - bb2 * s : bb2 * c + aa * s;
+            }
+            ak[j] = kvv;
+            av[j] = b2f(v[src + kb * 32 + j]);
+            mk = fmaxf(mk, fabsf(ak[j]));
+            mv = fmaxf(mv, fabsf(av[j]));
+        }
+        const int ek = mk > 0.f ? (int)ceilf(log2f(mk / 448.f)) : -127;
+        const int ev = mv > 0.f ? (int)ceilf(log2f(mv / 448.f)) : -127;
+        const float ik = 1.f / exp2f((float)ek), iv = 1.f / exp2f((float)ev);
+        for (int j = 0; j < 32; ++j) {
+            kc[dst + kb * 32 + j] = (uint8_t)__nv_cvt_float_to_fp8(ak[j] * ik, __NV_SATFINITE, __NV_E4M3);
+            vc[dst + kb * 32 + j] = (uint8_t)__nv_cvt_float_to_fp8(av[j] * iv, __NV_SATFINITE, __NV_E4M3);
+        }
+        ks[sdst + kb] = (uint8_t)(ek + 127);
+        vs[sdst + kb] = (uint8_t)(ev + 127);
+    }
+    pdl_launch();
+}
+
 extern "C" __global__ void glm_kv_append_q8(uint8_t* __restrict__ kc, uint8_t* __restrict__ vc,
                                             uint8_t* __restrict__ ks, uint8_t* __restrict__ vs,
                                             const bf16* __restrict__ k, const bf16* __restrict__ v,
@@ -272,6 +333,69 @@ static DEV uint8_t e2m1_code(float x) {
 
 // fp4 KV append: e2m1 nibbles with one e8m0 scale per 32 values, so a head-position costs
 // hd/2 payload bytes plus hd/32 exponent bytes instead of 2*hd.
+extern "C" __global__ void glm_rope_kv_q4(uint8_t* __restrict__ kc, uint8_t* __restrict__ vc,
+                                            uint8_t* __restrict__ ks, uint8_t* __restrict__ vs,
+                                            bf16* __restrict__ q, const bf16* __restrict__ k,
+                                            const bf16* __restrict__ v, const int* __restrict__ pos,
+                                            int rows, int nq, int nkv, int hd, int rot, float theta,
+                                            int max_seq) {
+    pdl_wait();
+    const float lgt = log2f(theta);
+    const int half = rot >> 1;
+    // rotate Q in place; K is rotated on the fly below, so it is never written back
+    const int qtotal = rows * nq * half;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < qtotal; idx += gridDim.x * blockDim.x) {
+        const int e = idx % half, t = idx / half;
+        const int qr = t / nq, qh = t % nq;
+        bf16* qb = q + ((size_t)qr * nq + qh) * hd;
+        const float ang = (float)pos[qr] * exp2f(-(float)(2 * e) / (float)rot * lgt);
+        float c, s;
+        __sincosf(ang, &s, &c);
+        const float a = b2f(qb[e]), bb = b2f(qb[e + half]);
+        qb[e] = f2b(a * c - bb * s);
+        qb[e + half] = f2b(bb * c + a * s);
+    }
+    const int r = blockIdx.x / nkv, h = blockIdx.x % nkv;
+    if (r >= rows) return;
+    const int p = pos[0] + r;
+    const size_t src = ((size_t)r * nkv + h) * hd;
+    const size_t dst = ((size_t)h * max_seq + p) * (hd / 2);
+    const size_t sdst = ((size_t)h * max_seq + p) * (hd / 32);
+    for (int kb = threadIdx.x; kb < hd / 32; kb += blockDim.x) {
+        float ak[32], av[32];
+        float mk = 0.f, mv = 0.f;
+        for (int j = 0; j < 32; ++j) {
+            const int col = kb * 32 + j;
+            float kvv = b2f(k[src + col]);
+            if (col < rot) {
+                const int e = col < half ? col : col - half;
+                const bf16* head = k + src;
+                const float aa = b2f(head[e]), bb2 = b2f(head[e + half]);
+                const float ang = (float)p * exp2f(-(float)(2 * e) / (float)rot * lgt);
+                float c, s;
+                __sincosf(ang, &s, &c);
+                kvv = col < half ? aa * c - bb2 * s : bb2 * c + aa * s;
+            }
+            ak[j] = kvv;
+            av[j] = b2f(v[src + kb * 32 + j]);
+            mk = fmaxf(mk, fabsf(ak[j]));
+            mv = fmaxf(mv, fabsf(av[j]));
+        }
+        const int ek = mk > 0.f ? (int)ceilf(log2f(mk / 6.f)) : -127;
+        const int ev = mv > 0.f ? (int)ceilf(log2f(mv / 6.f)) : -127;
+        const float ik = 1.f / exp2f((float)ek), iv = 1.f / exp2f((float)ev);
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t kk = e2m1_code(ak[2 * j] * ik) | (e2m1_code(ak[2 * j + 1] * ik) << 4);
+            const uint8_t vv = e2m1_code(av[2 * j] * iv) | (e2m1_code(av[2 * j + 1] * iv) << 4);
+            kc[dst + kb * 16 + j] = kk;
+            vc[dst + kb * 16 + j] = vv;
+        }
+        ks[sdst + kb] = (uint8_t)(ek + 127);
+        vs[sdst + kb] = (uint8_t)(ev + 127);
+    }
+    pdl_launch();
+}
+
 extern "C" __global__ void glm_kv_append_q4(uint8_t* __restrict__ kc, uint8_t* __restrict__ vc,
                                             uint8_t* __restrict__ ks, uint8_t* __restrict__ vs,
                                             const bf16* __restrict__ k, const bf16* __restrict__ v,

@@ -46,7 +46,8 @@ source greps, so `#ifdef`-gated variants are counted.
 | Upstream mechanism | Port |
 |---|---|
 | `griddepcontrol.wait/launch_dependents` in every kernel (27 upstream units) | added to all 42 port kernels, `Launch::new` sets the programmatic-serialization attribute by default |
-| fused rope into the following kernel (`gemv.cu:135-140`, `rope.cuh:56-124`) | `glm_rope_kv`: rotates Q, rotates K and appends K/V in one launch, replacing `glm_rope_qk` + `glm_kv_append` for bf16 KV |
+| fused rope into the following kernel (`gemv.cu:135-140`, `rope.cuh:56-124`) | `glm_rope_kv` (bf16), `glm_rope_kv_q8`, `glm_rope_kv_q4`: rotate Q, rotate K and append K/V in one launch, replacing `glm_rope_qk` + `glm_kv_append(_q8/_q4)` in every KV mode |
+| opt-in scope of the launch attribute | `Launch::new` stays opt-in; only the port's own launches (and the bracketed tcgen05 ones) request it, so the 81 unbracketed upstream kernels are not opted in |
 | tabulated / cheap rope angles (`rope.cuh:21-22`) | `log2`-domain frequency with `exp2f` and `__sincosf` instead of `powf` + `cosf` + `sinf` |
 
 ## Still open
@@ -57,6 +58,8 @@ source greps, so `#ifdef`-gated variants are counted.
   e8m0 fp4 KV packing; the mask only matters for partially filled prestage buffers.
 - `ops.cu::rope_quant` — fused rope + quantise for prefill; the port ropes and quantises in two
   passes.
+- late `pdl_wait` placement: the port waits at kernel entry, upstream (`tcgemv2.cu:239`) waits just
+  before the first dependent load, which hides more than launch latency.
 - persistent TMA-ring GEMV (`gemv_fp8b_persist_p4`, `gemv_bf16_persist_p4`), which also folds
   top-8 selection and the softmax denominator into the epilogue.
 - fused-epilogue variants `tc_gemv2_qb/part/oa/gate` and `tc_gemv3yr_qb`, which fold rmsnorm

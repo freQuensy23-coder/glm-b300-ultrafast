@@ -582,10 +582,7 @@ pub struct Launch {
 
 impl Launch {
     pub fn new(grid: u32, block: u32) -> Self {
-        // Programmatic dependent launch is the default: every kernel in this tree brackets its
-    // body with griddepcontrol wait/launch, so consecutive launches overlap instead of
-    // serialising; kernels that do not opt in simply decline the overlap.
-    Launch { grid: (grid, 1, 1), block: (block, 1, 1), smem: 0, pdl: true, cluster: None }
+        Launch { grid: (grid, 1, 1), block: (block, 1, 1), smem: 0, pdl: false, cluster: None }
     }
     pub fn grid3(mut self, g: (u32, u32, u32)) -> Self {
         self.grid = g;

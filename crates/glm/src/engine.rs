@@ -249,7 +249,9 @@ impl Engine {
     }
 
     fn launch(&self, name: &str, cfg: Launch, a: &mut Args) -> Result<()> {
-        cu::launch(self.k.get(name)?, &cfg, &self.s, a)
+        // Every kernel in this crate brackets its body with griddepcontrol, so asking for
+        // programmatic serialisation lets consecutive launches overlap.
+        cu::launch(self.k.get(name)?, &cfg.pdl(true), &self.s, a)
     }
 
     /// Upload token ids and their absolute positions for the next `m` rows.
@@ -304,15 +306,27 @@ impl Engine {
     }
 
     /// Rotate Q in place and append rope'd K plus V to the bf16 cache in a single pass.
-    fn rope_kv_append(&self, slot: usize, m: usize) -> Result<()> {
+    fn rope_kv_append(&self, slot: usize, _start: usize, m: usize) -> Result<()> {
         let (kc, vc) = self.kv.ptrs(slot);
         let c = &self.cfg;
         let mut a = Args::new();
-        a.ptr(self.b.q.ptr).ptr(self.b.kn.ptr).ptr(self.b.vn.ptr).ptr(kc).ptr(vc).ptr(self.b.tob.ptr)
-            .i32(m as i32).i32(c.n_heads as i32).i32(c.n_kv as i32).i32(c.head_dim as i32)
-            .i32(c.rope_dim as i32).f32(c.rope_theta).i32(self.kv.max_seq as i32);
-        let total = (m * (c.n_heads * (c.rope_dim / 2) + c.n_kv * c.head_dim)) as u32;
-        self.launch("glm_rope_kv", Launch::new(total.div_ceil(256).max(1).min(4096), 256), &mut a)
+        let name = match self.kv.mode {
+            crate::cache::KvMode::Bf16 => "glm_rope_kv",
+            crate::cache::KvMode::Fp8 => "glm_rope_kv_q8",
+            crate::cache::KvMode::Fp4 => "glm_rope_kv_q4",
+        };
+        if self.kv.mode == crate::cache::KvMode::Bf16 {
+            a.ptr(self.b.q.ptr).ptr(self.b.kn.ptr).ptr(self.b.vn.ptr).ptr(kc).ptr(vc).ptr(self.b.tob.ptr)
+                .i32(m as i32).i32(c.n_heads as i32).i32(c.n_kv as i32).i32(c.head_dim as i32)
+                .i32(c.rope_dim as i32).f32(c.rope_theta).i32(self.kv.max_seq as i32);
+            let total = (m * (c.n_heads * (c.rope_dim / 2) + c.n_kv * c.head_dim)) as u32;
+            return self.launch(name, Launch::new(total.div_ceil(256).max(1).min(4096), 256), &mut a);
+        }
+        let (ks, vs) = self.kv.scale_ptrs(slot);
+        a.ptr(kc).ptr(vc).ptr(ks).ptr(vs).ptr(self.b.q.ptr).ptr(self.b.kn.ptr).ptr(self.b.vn.ptr)
+            .ptr(self.b.tob.ptr).i32(m as i32).i32(c.n_heads as i32).i32(c.n_kv as i32)
+            .i32(c.head_dim as i32).i32(c.rope_dim as i32).f32(c.rope_theta).i32(self.kv.max_seq as i32);
+        self.launch(name, Launch::new(((m * c.n_kv) as u32).max(1), 128), &mut a)
     }
 
     fn kv_append(&self, slot: usize, _start: usize, m: usize) -> Result<()> {
@@ -591,13 +605,8 @@ impl Engine {
         }
         self.norm_heads(self.b.q.ptr, layer.q_norm.ptr, c.n_heads, m)?;
         self.norm_heads(self.b.kn.ptr, layer.k_norm.ptr, c.n_kv, m)?;
-        if self.kv.mode == crate::cache::KvMode::Bf16 {
-            // one launch rotates Q, rotates K and appends both rows to the cache
-            self.rope_kv_append(slot, m)?;
-        } else {
-            self.rope(self.b.q.ptr, self.b.kn.ptr, m)?;
-            self.kv_append(slot, start, m)?;
-        }
+        // Every KV mode fuses the rotation into the append: one launch and one round-trip.
+        self.rope_kv_append(slot, start, m)?;
         if prefill {
             self.attn_prefill(slot, start, m)?;
         } else {
