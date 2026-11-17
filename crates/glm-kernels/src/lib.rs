@@ -38,6 +38,7 @@ const MODULES: &[(&str, &[&str])] = &[
     ("sample", &["glm_argmax", "glm_sample", "glm_spec_accept", "glm_spec_pick", "glm_build_rows", "glm_stage_pos", "glm_prev_pos", "glm_stage_pos_rel"]),
     // Reused upstream tensor-core kernels (compiled from ../kernels/cu).
     ("u_tcgemv", &["tc_gemv_fp8", "tc_gemv_bf16"]),
+    ("u_tcgemv2", &["tc_gemv2_fp8", "tc_gemv2_bf16", "tc_gemv2_qkv"]),
     (
         "u_gemv",
         &[

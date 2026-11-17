@@ -28,7 +28,7 @@ fn main() {
     // splits) that a hand port would only re-derive. They compile from their own directory
     // so their `#include "common.cuh"` resolves to the upstream header, not ours.
     let upstream = PathBuf::from("../kernels/cu");
-    for name in ["tcgemv.cu", "tcgemm.cu", "tcmoe.cu", "variant_zzzzzzzzzzmoe.cu", "gemv.cu"] {
+    for name in ["tcgemv.cu", "tcgemm.cu", "tcmoe.cu", "variant_zzzzzzzzzzmoe.cu", "gemv.cu", "tcgemv2.cu"] {
         let p = upstream.join(name);
         if p.exists() {
             println!("cargo:rerun-if-changed={}", p.display());

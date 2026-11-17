@@ -21,6 +21,12 @@ pub fn set_on(v: bool) {
     TC.store(v, Ordering::Relaxed);
 }
 
+/// Gen-2 GEMV switch (`GLM_TC2=0` pins the first generation).
+pub fn gemv2_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("GLM_TC2").as_deref() != Ok("0"))
+}
+
 pub fn on() -> bool {
     TC.load(Ordering::Relaxed)
 }
@@ -162,6 +168,124 @@ pub struct GemvParams {
 }
 
 const _: () = assert!(std::mem::size_of::<GemvParams>() == 432);
+
+/// Mirror of `Tg2Params` in tcgemv2.cu (352 bytes) — the second-generation tensor-core GEMV.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Tg2Params {
+    pub tmap: u64,
+    pub sfa: u64,
+    pub x: u64,
+    pub gamma: u64,
+    pub bimg: u64,
+    pub rs_part: u64,
+    pub out: u64,
+    pub out2: u64,
+    pub rope_cos: u64,
+    pub rope_sin: u64,
+    pub meta: u64,
+    pub qimg: u64,
+    pub qgamma: u64,
+    pub qssq: u64,
+    pub kvr: RopeBlob,
+    pub alpha: f32,
+    pub eps: f32,
+    pub M: i32,
+    pub N: i32,
+    pub K: i32,
+    pub kpt: i32,
+    pub ldx: i32,
+    pub ldo: i32,
+    pub ldo2: i32,
+    pub n_split: i32,
+    pub out_f32: i32,
+    pub bsrc: i32,
+    pub rs_n: i32,
+    pub rs_stride: i32,
+    pub rs_rowstride: i32,
+    pub rs_off: i32,
+    pub rope_head: i32,
+    pub rope_off: i32,
+    pub iq_head: i32,
+    pub iq_off: i32,
+    pub partial: i32,
+    pub group_rows: i32,
+    pub qrows: i32,
+    pub kvr_on: i32,
+    pub xq: u64,
+    pub xsq: u64,
+    pub ssp: i32,
+    pub rs_pre: i32,
+    pub nacc: i32,
+    pub bload: i32,
+    pub flags: i32,
+}
+
+const _: () = assert!(std::mem::size_of::<Tg2Params>() == 352);
+
+impl TcWeight {
+    /// Second-generation decode GEMV (`tc_gemv2_*`): same contract as [`TcWeight::gemv`], but the
+    /// kernel pipelines the weight come in one persistent pass and takes pre-quantised rows.
+    /// `aq`/`sfa` are the pre-quantised activation image and its e8m0 scales (`bsrc == 0`).
+    pub fn gemv2(
+        &self,
+        kern: &glm_kernels::Kernels,
+        s: &cu::Stream,
+        aq: cu::DevPtr,
+        sfa: cu::DevPtr,
+        m: usize,
+        out: cu::DevPtr,
+        ldo: usize,
+    ) -> Result<()> {
+        ensure!(m <= 8, "tc gemv2: m <= 8 (kernel bound)");
+        let f = kern.get("tc_gemv2_fp8")?;
+        f.set_max_dynamic_smem(self.smem as u32)?;
+        let p = Tg2Params {
+            tmap: self.tmap.ptr,
+            sfa: self.sf.ptr,
+            out,
+            alpha: 1.0,
+            M: m as i32,
+            N: self.n as i32,
+            K: self.k as i32,
+            kpt: (self.k / 128) as i32,
+            ldx: self.k as i32,
+            ldo: ldo as i32,
+            out_f32: 1,
+            // bsrc 0 selects the pre-quantised activation image
+            bsrc: 0,
+            xq: aq,
+            xsq: sfa,
+            ..Default::default()
+        };
+        let gx = (self.n / 128) as u32;
+        let mut cfg = cu::Launch::new(gx, 128).grid3((gx, self.cs as u32, 1)).smem(self.smem as u32);
+        cfg.cluster = Some((1, self.cs as u32, 1));
+        cu::launch(f, &cfg, s, cu::Args::new().push(p))
+    }
+
+    /// Quantise `x` in place into the activation image, then run the gen-2 GEMV.
+    pub fn gemv2_bf16(
+        &self,
+        kern: &glm_kernels::Kernels,
+        s: &cu::Stream,
+        x: cu::DevPtr,
+        m: usize,
+        out: cu::DevPtr,
+        ldo: usize,
+    ) -> Result<()> {
+        ensure!(m <= 8, "tc gemv2: m <= 8 (kernel bound)");
+        let rows = m.next_multiple_of(128);
+        let mut slot = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let stale = slot.as_ref().map(|(r, _, _)| *r != rows).unwrap_or(true);
+        if stale {
+            *slot = Some((rows, cu::Buffer::alloc(rows * self.k)?, cu::Buffer::alloc((rows / 128) * (self.k / 128) * 512)?));
+        }
+        let (_, aq, sfa) = slot.as_ref().unwrap();
+        quant_mx_into(kern, s, x, self.k, m, self.k, aq.ptr, sfa.ptr, None)?;
+        self.gemv2(kern, s, aq.ptr, sfa.ptr, m, out, ldo)
+    }
+}
 
 /// Mirror of `TgParams` in `tcgemm.cu` (prefill GEMM). Offsets taken from the compiled
 /// C++ struct; `ta` is the activation map, `tb` the weight map.

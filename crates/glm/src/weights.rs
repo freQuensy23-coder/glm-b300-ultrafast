@@ -177,7 +177,12 @@ impl Linear {
             // the tensor-core GEMV reads rows at `k`, so a padded pitch has to stay on the FMA
             // kernels below instead of recursing back here
             if m <= 8 && ld_x == self.k {
-                tc.gemv_bf16(k, s, x, m, y, ld_y)?;
+                // gen-2 GEMV by default; GLM_TC2=0 falls back to the first generation
+                if crate::tc::gemv2_on() {
+                    tc.gemv2_bf16(k, s, x, m, y, ld_y)?;
+                } else {
+                    tc.gemv_bf16(k, s, x, m, y, ld_y)?;
+                }
                 return Ok(());
             }
         }
